@@ -3,6 +3,7 @@
 An automated SHORT-only mean-reversion trading bot for Bybit USDT linear perpetuals. Fades overextended price moves using EMA-smoothed premium bands, with an integrated parameter optimiser that re-tunes itself every 8 hours.
 
 Symbols, leverage, intervals, and all strategy parameters are fully configurable — either through the GUI settings panel, a JSON config file, or `POLE_POSITION/utils/constants.py`.
+<img width="966" height="840" alt="Screenshot 2026-03-05 at 9 25 55 PM" src="https://github.com/user-attachments/assets/97fda080-b9a0-4ddc-af59-9377b9c57a8f" />
 
 ---
 
