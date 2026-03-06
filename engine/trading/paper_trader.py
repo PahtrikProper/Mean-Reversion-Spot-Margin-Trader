@@ -24,16 +24,19 @@ from ..utils.constants import (
     MAX_SYMBOL_FRACTION,
     MIN_WALLET_USDT,
     LIVE_TP_SCALE,
+    TIME_TP_HOURS,
+    TIME_TP_FALLBACK_PCT,
+    TIME_TP_SCALE,
     COLOR_ENTRY,
     COLOR_EXIT,
     COLOR_ERROR,
     COLOR_RESET,
     COLOR_SUBMITTED,
-    TRADES_CSV_PATH,
 )
 from ..utils.data_structures import RealPosition, EntryParams, ExitParams, MC_MIN_TRADES, MC_SIMS
 from ..utils.position_gate import PositionGate
-from ..utils.logger import log_order, csv_append
+from ..utils.logger import log_order
+from ..utils import db_logger as _db
 from ..utils.helpers import now_ms, interval_minutes, leverage_for, taker_fee_for, maker_fee_for
 from ..utils.trading_status import get_status_monitor
 from ..core.indicators import (
@@ -108,6 +111,7 @@ class PaperTrader:
         self._entry_time: Optional[pd.Timestamp]  = None
         self._entry_price: Optional[float]        = None
         self._min_low_since_entry: Optional[float] = None
+        self._time_tp_applied: bool               = False  # True once 12h TP tightening fires
 
         self.trade_count      = 0
         self.win_count        = 0
@@ -186,6 +190,7 @@ class PaperTrader:
 
     def on_mark_price_update(self, mark_price: float, ts_utc: str):
         self.mark_price = float(mark_price)
+        _db.log_mark_price_tick(ts_utc=ts_utc, symbol=self.symbol, mark_price=self.mark_price)
 
     # ── Account PnL ────────────────────────────────────────────────────────────
 
@@ -225,12 +230,27 @@ class PaperTrader:
 
     def _execute_entry(self, close_price: float, ts_utc: str, bar_ts: pd.Timestamp):
         if self.position is not None:
+            _db.log_event(ts_utc=ts_utc, level="INFO", event_type="ENTRY_SKIPPED",
+                symbol=self.symbol,
+                message="Entry signal fired but already in position — no pyramiding",
+                detail={"reason": "ALREADY_IN_POSITION", "close": close_price,
+                        "entry_price": self.position.entry_price if self.position else None})
             return
         if self.wallet < MIN_WALLET_USDT:
             log.warning(f"[PAPER][{ts_utc}] Skipping entry — wallet {self.wallet:.4f} < {MIN_WALLET_USDT}")
+            _db.log_event(ts_utc=ts_utc, level="WARNING", event_type="ENTRY_SKIPPED",
+                symbol=self.symbol,
+                message=f"Wallet {self.wallet:.4f} USDT below minimum {MIN_WALLET_USDT} USDT",
+                detail={"reason": "INSUFFICIENT_WALLET", "wallet": self.wallet,
+                        "min_wallet": MIN_WALLET_USDT, "close": close_price})
             return
         if not self.gate.try_acquire(self.symbol):
             log.warning(f"[PAPER][{ts_utc}] Skipping entry — gate blocked")
+            _db.log_event(ts_utc=ts_utc, level="WARNING", event_type="ENTRY_SKIPPED",
+                symbol=self.symbol,
+                message="Position gate blocked — another symbol holds the slot",
+                detail={"reason": "GATE_BLOCKED", "close": close_price,
+                        "wallet": self.wallet})
             return
 
         wallet_before = self.wallet
@@ -287,6 +307,13 @@ class PaperTrader:
 
         except Exception as e:
             log.error(f"[PAPER][{ts_utc}] Entry failed: {e}")
+            _db.log_event(ts_utc=ts_utc, level="ERROR", event_type="ENTRY_FAILED",
+                symbol=self.symbol,
+                message=f"Paper entry execution failed: {e}",
+                detail={"reason": str(e), "close": close_price, "wallet": wallet_before,
+                        "ma_len": self.entry_params.ma_len,
+                        "band_mult": self.entry_params.band_mult,
+                        "tp_pct": self.exit_params.tp_pct})
             self.gate.release(self.symbol)
 
     # ── Exit execution ──────────────────────────────────────────────────────────
@@ -326,6 +353,14 @@ class PaperTrader:
 
         except Exception as e:
             log.error(f"[PAPER][{ts_utc}] Exit failed: {e}")
+            _db.log_event(ts_utc=ts_utc, level="ERROR", event_type="EXIT_FAILED",
+                symbol=self.symbol,
+                message=f"Paper exit execution failed: {e}",
+                detail={"reason": str(e), "exit_reason": reason,
+                        "close": close_price,
+                        "entry_price": entry_price,
+                        "qty": qty_abs,
+                        "wallet_before": wallet_before})
         finally:
             # Always clear position state and release gate
             self.position              = None
@@ -336,6 +371,7 @@ class PaperTrader:
             self._entry_time           = None
             self._entry_price          = None
             self._min_low_since_entry  = None
+            self._time_tp_applied      = False
             self.gate.release(self.symbol)
             self._update_account_pnl()
 
@@ -368,21 +404,30 @@ class PaperTrader:
             result = "WIN" if win else "LOSS"
 
         fee_logged = exit_fee if side == "COVER" else entry_fee
-        csv_append(TRADES_CSV_PATH, [
-            ts_utc, f"[PAPER]{self.symbol}", action, reason, f"{side}_SIGNAL",
-            side, float(qty), float(fill_price),
-            float(qty * fill_price), float(fee_logged),
-            float(entry_price), float(tp_price),
-            float(self.mark_price),
-            float(wallet_before), float(wallet_after),
-            float(pnl_gross), float(pnl_net),
-            float(pnl_net / float(self.leverage)) if self.leverage else 0.0,
-            float(pnl_net / float(self.initial_wallet) * 100.0) if self.initial_wallet > 0 else 0.0,
-            result,
-            self.entry_params.ma_len,
-            float(self.entry_params.band_mult),
-            float(self.exit_params.tp_pct),
-        ])
+        pnl_1x = float(pnl_net / float(self.leverage)) if self.leverage else 0.0
+        pnl_pct_val = float(pnl_net / float(self.initial_wallet) * 100.0) if self.initial_wallet > 0 else 0.0
+
+        _db.log_trade(
+            ts_utc=ts_utc, mode="paper", symbol=self.symbol, interval=self.interval,
+            action=action, reason=reason, side=side,
+            qty=float(qty), fill_price=float(fill_price),
+            notional=float(qty * fill_price), fee=float(fee_logged),
+            entry_price=float(entry_price), tp_price=float(tp_price),
+            mark_price=float(self.mark_price),
+            wallet_before=float(wallet_before), wallet_after=float(wallet_after),
+            pnl_gross=float(pnl_gross), pnl_net=float(pnl_net),
+            pnl_1x_usdt=pnl_1x, pnl_pct=pnl_pct_val,
+            result=result,
+            ma_len=self.entry_params.ma_len,
+            band_mult=float(self.entry_params.band_mult),
+            tp_pct=float(self.exit_params.tp_pct),
+        )
+        _db.log_balance_snapshot(
+            ts_utc=ts_utc, symbol=self.symbol, event=f"PAPER_{action}",
+            wallet_usdt=float(wallet_after),
+            session_pnl_usdt=float(wallet_after - float(self.initial_wallet)),
+            session_pnl_pct=float((wallet_after - float(self.initial_wallet)) / float(self.initial_wallet) * 100.0) if self.initial_wallet > 0 else 0.0,
+        )
 
         if action == "EXIT":
             pnl_sign     = "+" if pnl_net >= 0 else ""
@@ -495,6 +540,7 @@ class PaperTrader:
                 leverage=lev, fee_rate=fee, maker_fee_rate=maker_fee,
                 interval_minutes=interval_minutes(self.interval),
                 saved_best=saved_best,
+                db_symbol=self.symbol, db_interval=self.interval, db_trigger="REOPT",
             )
 
             new_entry  = opt["entry_params"]
@@ -516,6 +562,30 @@ class PaperTrader:
                 f"[PAPER][REOPT] {self.symbol}: MC score={new_mc_score:.4f} | "
                 f"MA-len={new_entry.ma_len}  BandMult={new_entry.band_mult:.2f}%  "
                 f"TP={new_exit.tp_pct*100:.2f}%"
+            )
+
+            _ts_reopt = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
+
+            # DB: MC run
+            if mc_res:
+                _db.log_monte_carlo(
+                    ts_utc=_ts_reopt, symbol=self.symbol, interval=self.interval,
+                    mc_results=mc_res, score=new_mc_score if new_mc_score != float("-inf") else None,
+                )
+
+            # DB: params event
+            _event = "REOPT_ACCEPTED" if new_mc_score > 0 else "REOPT_REJECTED"
+            _db.log_params(
+                ts_utc=_ts_reopt, symbol=self.symbol, interval=self.interval,
+                event=_event,
+                ma_len=new_entry.ma_len, band_mult=new_entry.band_mult, tp_pct=new_exit.tp_pct,
+                mc_score=new_mc_score if new_mc_score != float("-inf") else None,
+                sharpe=new_result.sharpe_ratio,
+                pnl_pct=new_result.pnl_pct,
+                max_drawdown_pct=new_result.max_drawdown_pct,
+                trade_count=new_result.trades,
+                winrate=new_result.winrate,
+                wallet=self.wallet,
             )
 
             if new_mc_score > 0:
@@ -552,6 +622,7 @@ class PaperTrader:
         c   = float(candle["close"])
         vol = float(candle.get("volume", 0))
 
+        ts_ms = int(candle["start"])
         new_row = pd.DataFrame([{"ts": ts, "open": o, "high": h, "low": l, "close": c, "volume": vol}])
         self.df = pd.concat([self.df, new_row], ignore_index=True)
         if len(self.df) > KEEP_CANDLES:
@@ -560,6 +631,13 @@ class PaperTrader:
         self._recompute_indicators()
         self.closed_candle_count += 1
         self._maybe_reoptimise()
+
+        # ── DB: raw candle ──
+        _db.log_candle(
+            ts_utc=ts_utc, ts_ms=ts_ms, symbol=self.symbol,
+            interval=self.interval, price_type="last",
+            o=o, h=h, l=l, c=c, vol=vol,
+        )
 
         # Refresh liquidation price with latest mark price
         if self.position is not None:
@@ -583,30 +661,191 @@ class PaperTrader:
 
         adx_val = float(row["adx"])
         rsi_val = float(row["rsi"]) if not pd.isna(row["rsi"]) else 100.0
+        atr_val = float(row["atr"]) if "atr" in self.df.columns and not pd.isna(row["atr"]) else 0.0
 
         _raw_short = compute_entry_signals_raw(
             current_row=row, prev_row=prev,
             current_high=h, current_low=l,
         )
         entry_sig = resolve_entry_signals(_raw_short, adx_val, rsi_val) > 0
+        _final_short = resolve_entry_signals(_raw_short, adx_val, rsi_val)
         exit_sig  = compute_exit_signals_raw(
             current_row=row, prev_row=prev,
             current_low=l, current_high=h,
         ) > 0
+        _raw_exit = compute_exit_signals_raw(
+            current_row=row, prev_row=prev,
+            current_low=l, current_high=h,
+        )
+
+        # ── DB: candle analytics ──
+        _db.log_candle_analytics(
+            ts_utc=ts_utc, symbol=self.symbol, interval=self.interval,
+            df=self.df, mark_price=self.mark_price,
+            ma_len=self.entry_params.ma_len, band_mult=self.entry_params.band_mult,
+        )
+
+        # ── DB: signal ──
+        _trail_stop_lvl = None
+        if self.position is not None and self._min_low_since_entry is not None and atr_val > 0:
+            _trail_stop_lvl = self._min_low_since_entry + float(self.exit_params.trail_atr_mult) * atr_val
+
+        if entry_sig:
+            _sig_type  = "ENTRY"
+            _blocked   = None
+        elif _raw_exit > 0:
+            _sig_type  = "EXIT_BAND"
+            _blocked   = None
+        elif _trail_stop_lvl is not None and h >= _trail_stop_lvl:
+            _sig_type  = "EXIT_TRAIL"
+            _blocked   = None
+        else:
+            _sig_type  = "NONE"
+            _blocked_entry = None
+            if _raw_short > 0 and _final_short == 0:
+                _blocked_entry = "ADX" if adx_val >= 25 else "RSI"
+            _blocked = _blocked_entry
+
+        _db.log_signal(
+            ts_utc=ts_utc, symbol=self.symbol, interval=self.interval,
+            signal_type=_sig_type,
+            raw_band_level=_raw_short, final_band_level=_final_short,
+            adx=adx_val, rsi=rsi_val, atr=atr_val if atr_val else None,
+            trail_stop_level=_trail_stop_lvl,
+            blocked_by=_blocked,
+            o=o, h=h, l=l, c=c,
+            ma_len=self.entry_params.ma_len,
+            band_mult=self.entry_params.band_mult,
+            tp_pct=self.exit_params.tp_pct,
+        )
+
+        # ── DB: position snapshot ──
+        if self.position is not None:
+            _qty_abs  = abs(self.position.qty)
+            _upnl     = (self.position.entry_price - self.mark_price) * _qty_abs
+            _tp_snap  = self._paper_tp_price
+            _ts_entry = self._entry_time.strftime("%Y-%m-%d %H:%M:%S") if self._entry_time else None
+            _trail_snap = _trail_stop_lvl
+            _db.log_position(
+                ts_utc=ts_utc, symbol=self.symbol,
+                qty=-_qty_abs,
+                entry_price=self.position.entry_price,
+                entry_time=_ts_entry,
+                mark_price=self.mark_price,
+                liquidation_price=self._paper_liq_price,
+                unrealized_pnl=_upnl,
+                min_low_since_entry=self._min_low_since_entry,
+                trail_stop_price=_trail_snap,
+                tp_price=_tp_snap,
+                wallet=self.wallet,
+            )
+        else:
+            _db.log_position(
+                ts_utc=ts_utc, symbol=self.symbol,
+                qty=None, entry_price=None, entry_time=None,
+                mark_price=self.mark_price,
+                liquidation_price=None, unrealized_pnl=None,
+                min_low_since_entry=None, trail_stop_price=None,
+                tp_price=None, wallet=self.wallet,
+            )
 
         # ── Update trail stop tracking ──
         if self.position is not None and self._min_low_since_entry is not None:
             self._min_low_since_entry = min(self._min_low_since_entry, l)
 
+        # ── Time-based TP tightening (20h after entry → data-driven tighter TP) ──
+        if (self.position is not None
+                and self._entry_time is not None
+                and not self._time_tp_applied):
+            try:
+                elapsed_sec = (
+                    pd.Timestamp.now(tz="UTC").tz_convert(None)
+                    - self._entry_time.tz_convert(None)
+                ).total_seconds()
+                if elapsed_sec >= TIME_TP_HOURS * 3600:
+                    _dyn_tp_pct = _db.compute_time_tp_pct(
+                        symbol=self.symbol,
+                        min_hold_hours=TIME_TP_HOURS,
+                        fallback_pct=TIME_TP_FALLBACK_PCT,
+                        scale=TIME_TP_SCALE,
+                    )
+                    new_tp = self._format_price(
+                        self.position.entry_price * (1.0 - _dyn_tp_pct)
+                    )
+                    self._paper_tp_price  = new_tp
+                    self._time_tp_applied = True
+                    log.info(
+                        f"{COLOR_EXIT}[PAPER][{ts_utc}] {TIME_TP_HOURS:.0f}h elapsed — "
+                        f"TP tightened to {new_tp:.8f} ({_dyn_tp_pct*100:.3f}% from entry){COLOR_RESET}"
+                    )
+                    _db.log_event(
+                        ts_utc=ts_utc, level="INFO", event_type="TIME_TP_APPLIED",
+                        symbol=self.symbol,
+                        message=(
+                            f"{TIME_TP_HOURS:.0f}h time TP fired — target "
+                            f"{new_tp:.8f} ({_dyn_tp_pct*100:.3f}%)"
+                        ),
+                        detail={"entry_price": self.position.entry_price, "new_tp": new_tp,
+                                "elapsed_hours": round(elapsed_sec / 3600, 2),
+                                "time_tp_pct": _dyn_tp_pct,
+                                "is_fallback": _dyn_tp_pct == TIME_TP_FALLBACK_PCT},
+                    )
+            except Exception:
+                pass
+
         # ── Priority 1: Liquidation ──
         if self.position is not None and self._paper_liq_price is not None:
             if self.mark_price >= self._paper_liq_price:
-                qty_abs = abs(self.position.qty)
+                qty_abs          = abs(self.position.qty)
+                liq_price_snap   = self._paper_liq_price
+                entry_price_snap = self.position.entry_price
+                margin_snap      = self._paper_margin
+                entry_fee_snap   = self._paper_entry_fee
+                tp_snap          = self._paper_tp_price or 0.0
+                # wallet already has margin deducted — forfeiture means it stays as-is
+                wallet_liq       = self.wallet
+                pnl_net_liq      = -(margin_snap + entry_fee_snap)
+
                 log.info(
                     f"{COLOR_ERROR}[PAPER][{ts_utc}] LIQUIDATED  "
-                    f"mark={self.mark_price:.5f} >= liq={self._paper_liq_price:.5f}{COLOR_RESET}"
+                    f"mark={self.mark_price:.5f} >= liq={liq_price_snap:.5f}{COLOR_RESET}"
                 )
                 self.trade_count += 1  # liquidation counts as a loss
+
+                # Log liquidation as a trade row
+                _db.log_trade(
+                    ts_utc=ts_utc, mode="paper", symbol=self.symbol, interval=self.interval,
+                    action="EXIT", reason="LIQUIDATED",
+                    side="COVER", qty=qty_abs, fill_price=liq_price_snap,
+                    notional=qty_abs * liq_price_snap, fee=0.0,
+                    entry_price=entry_price_snap, tp_price=tp_snap,
+                    mark_price=self.mark_price,
+                    wallet_before=wallet_liq + margin_snap + entry_fee_snap,
+                    wallet_after=wallet_liq,
+                    pnl_gross=-margin_snap, pnl_net=pnl_net_liq,
+                    pnl_1x_usdt=float(pnl_net_liq / float(self.leverage)) if self.leverage else 0.0,
+                    pnl_pct=float(pnl_net_liq / float(self.initial_wallet) * 100.0) if self.initial_wallet > 0 else 0.0,
+                    result="LOSS",
+                    ma_len=self.entry_params.ma_len,
+                    band_mult=float(self.entry_params.band_mult),
+                    tp_pct=float(self.exit_params.tp_pct),
+                )
+                _db.log_balance_snapshot(
+                    ts_utc=ts_utc, symbol=self.symbol, event="PAPER_LIQUIDATED",
+                    wallet_usdt=wallet_liq,
+                    session_pnl_usdt=wallet_liq - float(self.initial_wallet),
+                    session_pnl_pct=float((wallet_liq - float(self.initial_wallet)) / float(self.initial_wallet) * 100.0) if self.initial_wallet > 0 else 0.0,
+                )
+                _db.log_event(
+                    ts_utc=ts_utc, level="ERROR", event_type="LIQUIDATION",
+                    symbol=self.symbol,
+                    message=f"Position liquidated: mark={self.mark_price:.5f} >= liq={liq_price_snap:.5f}",
+                    detail={"entry_price": entry_price_snap, "mark_price": self.mark_price,
+                            "liq_price": liq_price_snap, "qty": qty_abs,
+                            "margin_lost": margin_snap + entry_fee_snap,
+                            "wallet_after": wallet_liq},
+                )
+
                 # Entire margin is forfeited — wallet stays as post-entry value
                 self.position             = None
                 self._paper_margin        = 0.0
@@ -616,6 +855,7 @@ class PaperTrader:
                 self._entry_time          = None
                 self._entry_price         = None
                 self._min_low_since_entry = None
+                self._time_tp_applied     = False
                 self.gate.release(self.symbol)
                 self._update_account_pnl()
                 acted = True

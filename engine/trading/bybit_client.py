@@ -607,7 +607,16 @@ class BybitPrivateClient:
         side = row.get("side", "")
         entry_price = float(row.get("avgPrice", 0))
         qty = size if side == "Buy" else -size
-        return RealPosition(qty=qty, entry_price=entry_price, side=side)
+        liq_price = None
+        liq_str = row.get("liqPrice", "")
+        if liq_str:
+            try:
+                lp = float(liq_str)
+                if lp > 0:
+                    liq_price = lp
+            except (ValueError, TypeError):
+                pass
+        return RealPosition(qty=qty, entry_price=entry_price, side=side, liq_price=liq_price)
 
     def place_market_order(
         self,

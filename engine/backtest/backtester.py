@@ -28,6 +28,7 @@ from ..utils.constants import (
     SLIPPAGE_TICKS,
     TICK_SIZE,
     DEFAULT_TP_PCT,
+    TIME_TP_HOURS,
 )
 from ..utils.data_structures import TradeRecord, BacktestResult, MCSimResult, EntryParams, ExitParams
 from ..core.indicators import (
@@ -59,18 +60,25 @@ def backtest_once(
     leverage: float = 10.0,
     fee_rate: float = FEE_RATE,
     maker_fee_rate: Optional[float] = None,
+    time_tp_pct: float = 0.0,
+    interval_minutes_bt: int = 5,
 ) -> Optional[BacktestResult]:
     """Backtest Mean Reversion Strategy.
 
     Args:
-        df_last_raw:   Last-price OHLCV (ts, open, high, low, close, volume)
-        df_mark_raw:   Mark-price OHLCV (ts, open, high, low, close)
-        risk_df:       Bybit risk tier table
-        entry_params:  EntryParams(ma_len, band_mult)
-        exit_params:   ExitParams(tp_pct)
-        leverage:      Leverage multiplier
-        fee_rate:      Taker fee rate (exits)
-        maker_fee_rate: Maker fee rate (entries); defaults to fee_rate
+        df_last_raw:         Last-price OHLCV (ts, open, high, low, close, volume)
+        df_mark_raw:         Mark-price OHLCV (ts, open, high, low, close)
+        risk_df:             Bybit risk tier table
+        entry_params:        EntryParams(ma_len, band_mult)
+        exit_params:         ExitParams(tp_pct)
+        leverage:            Leverage multiplier
+        fee_rate:            Taker fee rate (exits)
+        maker_fee_rate:      Maker fee rate (entries); defaults to fee_rate
+        time_tp_pct:         If > 0, override TP with this fraction after TIME_TP_HOURS
+                             of position hold time (data-driven tighter exit).
+                             0.0 disables the time-based TP override.
+        interval_minutes_bt: Duration of each candle in minutes — used to convert
+                             hold-candle-count into hours for the time TP check.
 
     Returns:
         BacktestResult or None if insufficient data.
@@ -113,6 +121,14 @@ def backtest_once(
     in_position          = False
     liquidated           = False
     min_low_since_entry  = float("inf")  # Jason McIntosh trail stop tracking
+
+    # Time-based TP tightening — tracks when entry occurred and whether applied
+    entry_candle_idx:   int  = 0
+    time_tp_applied:    bool = False
+    _time_tp_candles:   int  = (
+        int(TIME_TP_HOURS * 60 / max(interval_minutes_bt, 1))
+        if time_tp_pct > 0 else 0
+    )
 
     trade_pnls:    List[float]       = []
     trade_records: List[TradeRecord] = []
@@ -160,8 +176,15 @@ def backtest_once(
                 liquidated = True
                 break
 
-            # 2. Take-profit (fixed)
-            tp_price = entry_price_bt * (1.0 - float(exit_params.tp_pct))
+            # 2. Take-profit (fixed or data-driven time override)
+            # After TIME_TP_HOURS of hold, switch to the tighter time-based TP.
+            _active_tp_pct = float(exit_params.tp_pct)
+            if (time_tp_pct > 0
+                    and _time_tp_candles > 0
+                    and (i - entry_candle_idx) >= _time_tp_candles):
+                time_tp_applied = True
+                _active_tp_pct  = time_tp_pct
+            tp_price = entry_price_bt * (1.0 - _active_tp_pct)
             if low_last <= tp_price:
                 fill      = _apply_slippage(tp_price, "buy")
                 pnl_gross = (entry_price_bt - fill) * qty_abs
@@ -173,11 +196,13 @@ def backtest_once(
                     side="SHORT", entry_price=entry_price_bt, exit_price=fill,
                     qty=qty_abs, entry_fee=entry_fee, exit_fee=exit_fee,
                     pnl_gross=pnl_gross, pnl_net=pnl_net,
-                    reason="TP", wallet_at_entry=wallet_at_entry,
+                    reason="TIME_TP" if time_tp_applied else "TP",
+                    wallet_at_entry=wallet_at_entry,
                 ))
                 pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                 wallet_at_entry = 0.0; in_position = False
                 min_low_since_entry = float("inf")
+                entry_candle_idx = 0; time_tp_applied = False
                 exited = True
 
             # 3. Jason McIntosh ATR trailing stop (SHORT)
@@ -203,6 +228,7 @@ def backtest_once(
                         pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                         wallet_at_entry = 0.0; in_position = False
                         min_low_since_entry = float("inf")
+                        entry_candle_idx = 0; time_tp_applied = False
                         exited = True
 
             # 4. Band exit (low drops below discount_k — mirrors premium band entry)
@@ -228,6 +254,7 @@ def backtest_once(
                     pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                     wallet_at_entry = 0.0; in_position = False
                     min_low_since_entry = float("inf")
+                    entry_candle_idx = 0; time_tp_applied = False
                     exited = True
 
         # ── Entry ─────────────────────────────────────────────────────────────
@@ -249,6 +276,8 @@ def backtest_once(
                 entry_fee            = fee
                 in_position          = True
                 min_low_since_entry  = low_last  # initialise trail stop tracking
+                entry_candle_idx     = i          # record candle index for time TP
+                time_tp_applied      = False
 
         # ── Equity snapshot ───────────────────────────────────────────────────
         if pos_qty != 0.0:

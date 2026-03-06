@@ -1,7 +1,7 @@
 # Mean Reversion Strategy — Reference Document
 
-**Version**: 5.0
-**Package**: `POLE_POSITION/`
+**Version**: 6.0
+**Package**: `engine/`
 **Instrument**: Bybit USDT linear perpetuals (configurable)
 **Direction**: SHORT only — no long trades exist or should be added
 
@@ -88,7 +88,7 @@ resolve_entry_signals(raw_short, adx, rsi) -> int
 | Priority | Exit Type | Trigger | Notes |
 |----------|-----------|---------|-------|
 | 1 | **Liquidation** | mark_high >= liq_price | Bybit isolated SHORT formula; checked in backtest, detected via position=None in live |
-| 2 | **Take-Profit** | low <= entry * (1 - tp_pct) | Server-side TP in live (Bybit LastPrice trigger); direct check in backtest |
+| 2 | **Take-Profit** | low <= entry * (1 - tp_pct) | Server-side TP in live (Bybit LastPrice trigger); direct check in backtest. After `TIME_TP_HOURS` (20 h) the tighter **data-driven TP** is substituted — reason logged as `TIME_TP` vs `TP` |
 | 3 | **Trail Stop** | high >= min_low_since_entry + trail_atr_mult × ATR | Jason McIntosh ATR trail — SHORT version |
 | 4 | **Band Exit** | discount band crossover-above-low | Mirror of entry signal, on discount bands + low |
 
@@ -140,6 +140,9 @@ compute_exit_signals_raw(current_row, prev_row, current_low, current_high) -> in
 | `TRAIL_ATR_PERIOD` | 14 | `constants.py` |
 | `TRAIL_ATR_MULT` | 3.0 | `constants.py` |
 | `LIVE_TP_SCALE` | 0.75 | `constants.py` |
+| `TIME_TP_HOURS` | 20.0 | `constants.py` |
+| `TIME_TP_FALLBACK_PCT` | 0.005 | `constants.py` |
+| `TIME_TP_SCALE` | 0.75 | `constants.py` |
 | `FEE_RATE` | 0.00055 | `constants.py` |
 | `MAKER_FEE_RATE` | 0.0002 | `constants.py` |
 | `SLIPPAGE_TICKS` | 1 | `constants.py` |
@@ -244,6 +247,9 @@ Paper trading uses `PaperTrader` (`paper_trader.py`) instead of `LiveRealTrader`
 9. **Gate must always be released when a position closes**, including on early returns and exceptions inside `_execute_exit`.
 10. **`LIVE_TP_SCALE = 0.75`** — the server-side TP distance is always scaled to 75% of the backtested distance.
 11. **`SLIPPAGE_TICKS = 1`** — applies to paper/backtest fills only; live fills rely on Bybit execution.
+12. **Data-driven time TP** — after `TIME_TP_HOURS` (20 h) of holding, `compute_time_tp_pct()` queries the top-3 profitable 20h+ exits from the DB, averages their TP%, scales by `TIME_TP_SCALE` (0.75), and substitutes the result as the active TP. Falls back to `TIME_TP_FALLBACK_PCT` (0.5%) if fewer than 3 qualifying trades exist. Exit reason is `TIME_TP` (not `TP`) when this fires.
+13. **SQLite only — no CSV or log files.** All trade data, signals, orders, optimisation runs, events, and diagnostics are written exclusively to `paper_logs/trading.db`. `csv_append` and `ensure_csv` in `logger.py` are permanent no-ops.
+14. **DB maintenance runs automatically.** `run_maintenance()` is called at startup (no VACUUM) and every 24 hours (full VACUUM) by a daemon thread in `main.py`. Each table has a defined retention period; stale rows are pruned before the WAL checkpoint and ANALYZE pass.
 
 ---
 
@@ -251,21 +257,22 @@ Paper trading uses `PaperTrader` (`paper_trader.py`) instead of `LiveRealTrader`
 
 | File | Role |
 |------|------|
-| `POLE_POSITION/core/indicators.py` | All indicator maths: RMA, EMA, ATR, ADX, RSI, band construction, crossover detection, signal generation |
-| `POLE_POSITION/core/orders.py` | Slippage simulation: `apply_slippage(price, side)` — 1 tick applied to all simulated fills |
-| `POLE_POSITION/backtest/backtester.py` | Historical backtest engine; single run and Monte Carlo |
-| `POLE_POSITION/optimize/optimizer.py` | Random-search optimiser over the 3-parameter space (ma_len, band_mult, tp_pct); `optimise_bayesian` is an alias for `optimise_params` |
-| `POLE_POSITION/trading/live_trader.py` | Live trading engine: WebSocket candle processing, entry/exit execution, re-optimisation |
-| `POLE_POSITION/trading/paper_trader.py` | Paper trading engine: simulates fills, fees, slippage, liquidation locally using public data |
-| `POLE_POSITION/trading/bybit_client.py` | Bybit REST + WebSocket client, order placement, execution polling |
-| `POLE_POSITION/trading/liquidation.py` | Exact Bybit isolated SHORT liquidation price formula |
-| `POLE_POSITION/utils/api_key_prompt.py` | Interactive API credential setup with hidden input; saves/loads `~/.bybit_credentials.json` |
-| `POLE_POSITION/utils/constants.py` | All configuration constants and defaults |
-| `POLE_POSITION/utils/data_structures.py` | `EntryParams`, `ExitParams`, `TradeRecord`, `BacktestResult`, `MCSimResult`, `RealPosition`, `PendingSignal` |
-| `POLE_POSITION/utils/helpers.py` | Rate limiter, interval parsing, fee/leverage lookups |
-| `POLE_POSITION/utils/logger.py` | Thread-safe CSV appender (`csv_append`) and colour-coded order log writer (`log_order`) |
-| `POLE_POSITION/utils/plotting.py` | ASCII equity-curve chart (`plot_pnl_chart`) and Monte Carlo terminal report (`print_monte_carlo_report`) |
-| `POLE_POSITION/utils/position_gate.py` | Thread-safe slot gate (MAX_SLOTS=1) |
-| `POLE_POSITION/utils/trading_status.py` | `TradingStatusMonitor`: background daemon printing full status tables every 3 minutes |
+| `engine/core/indicators.py` | All indicator maths: RMA, EMA, ATR, ADX, RSI, band construction, crossover detection, signal generation |
+| `engine/core/orders.py` | Slippage simulation: `apply_slippage(price, side)` — 1 tick applied to all simulated fills |
+| `engine/backtest/backtester.py` | Historical backtest engine; single run and Monte Carlo |
+| `engine/optimize/optimizer.py` | Random-search optimiser over the 3-parameter space (ma_len, band_mult, tp_pct); `optimise_bayesian` is an alias for `optimise_params` |
+| `engine/trading/live_trader.py` | Live trading engine: WebSocket candle processing, entry/exit execution, re-optimisation |
+| `engine/trading/paper_trader.py` | Paper trading engine: simulates fills, fees, slippage, liquidation locally using public data |
+| `engine/trading/bybit_client.py` | Bybit REST + WebSocket client, order placement, execution polling |
+| `engine/trading/liquidation.py` | Exact Bybit isolated SHORT liquidation price formula |
+| `engine/utils/api_key_prompt.py` | Interactive API credential setup with hidden input; saves/loads `~/.bybit_credentials.json` |
+| `engine/utils/constants.py` | All configuration constants and defaults |
+| `engine/utils/data_structures.py` | `EntryParams`, `ExitParams`, `TradeRecord`, `BacktestResult`, `MCSimResult`, `RealPosition`, `PendingSignal` |
+| `engine/utils/helpers.py` | Rate limiter, interval parsing, fee/leverage lookups |
+| `engine/utils/db_logger.py` | SQLite WAL singleton logger — all DB writes, `compute_time_tp_pct()`, `run_maintenance()` |
+| `engine/utils/logger.py` | Colour-coded console order logger (`log_order`); `csv_append` / `ensure_csv` are no-ops — all persistence is via SQLite |
+| `engine/utils/plotting.py` | ASCII equity-curve chart (`plot_pnl_chart`) and Monte Carlo terminal report (`print_monte_carlo_report`) |
+| `engine/utils/position_gate.py` | Thread-safe slot gate (MAX_SLOTS=1) |
+| `engine/utils/trading_status.py` | `TradingStatusMonitor`: background daemon printing full status tables every 3 minutes |
 | `main.py` | CLI entry point: download → optimise → rank → live or paper trade |
 | `gui.py` | CustomTkinter GUI entry point |

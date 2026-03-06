@@ -41,6 +41,15 @@ TICK_SIZE      = 0.0001      # for slippage simulation
 # 0.75 → live TP distance = 75% of the back-tested distance.
 LIVE_TP_SCALE = 0.75
 
+# ── Time-based TP tightening ─────────────────────────────────────────────────
+# If a position is still open after TIME_TP_HOURS, the TP is overridden with a
+# data-driven tighter target so the trade exits sooner.
+# The new TP = avg(top-3 highest-PnL 20h+ exits) × TIME_TP_SCALE.
+# Falls back to TIME_TP_FALLBACK_PCT when fewer than 3 qualifying trades exist.
+TIME_TP_HOURS        = 20.0   # hours after entry before tightening kicks in
+TIME_TP_FALLBACK_PCT = 0.005  # 0.5% fallback when DB has insufficient data
+TIME_TP_SCALE        = 0.75   # scale factor applied to the data-driven avg
+
 # ── Default strategy parameters ───────────────────────────────────────────────
 DEFAULT_MA_LEN       = 100    # RMA period for band centre line
 DEFAULT_BAND_MULT    = 2.5    # Band width multiplier (%)
@@ -125,6 +134,18 @@ EVENT_LOG_PATH  = os.path.join(LOG_DIR, "events.log")
 TRADES_CSV_PATH = os.path.join(LOG_DIR, "trades.csv")
 PARAMS_CSV_PATH = os.path.join(LOG_DIR, "params.csv")
 ORDERS_LOG_PATH = os.path.join(LOG_DIR, "orders.log")
+DB_PATH         = os.path.join(LOG_DIR, "trading.db")
+
+# ── Initialize SQLite database ────────────────────────────────────────────────
+def _init_db():
+    try:
+        from .db_logger import init_db
+        init_db(DB_PATH)
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger("constants").warning(f"DB init failed: {_e}")
+
+_init_db()
 
 # ── ANSI colors ───────────────────────────────────────────────────────────────
 COLOR_LONG      = "\033[94m"

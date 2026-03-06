@@ -2,7 +2,9 @@
 
 An automated SHORT-only mean-reversion trading bot for Bybit USDT linear perpetuals. Fades overextended price moves using EMA-smoothed premium bands, with an integrated parameter optimiser that re-tunes itself every 8 hours.
 
-Symbols, leverage, intervals, and all strategy parameters are fully configurable — either through the GUI settings panel, a JSON config file, or `POLE_POSITION/utils/constants.py`.
+Symbols, leverage, intervals, and all strategy parameters are fully configurable — either through the GUI settings panel, a JSON config file, or `engine/utils/constants.py`.
+
+All trade data, optimisation runs, signals, events, and diagnostics are written to a single SQLite database (`paper_logs/trading.db`). No CSV or log files are used.
 <img width="966" height="840" alt="Screenshot 2026-03-05 at 9 25 55 PM" src="https://github.com/user-attachments/assets/97fda080-b9a0-4ddc-af59-9377b9c57a8f" />
 
 ---
@@ -55,7 +57,7 @@ Mean Reversion Trader/
 ├── requirements.txt
 ├── requirements-build.txt
 ├── STRATEGY.md              # Full strategy specification
-└── POLE_POSITION/           # Core package
+└── engine/           # Core package
     ├── core/
     │   ├── indicators.py        # All indicator maths
     │   └── orders.py            # Slippage simulation
@@ -72,8 +74,9 @@ Mean Reversion Trader/
     │   ├── api_key_prompt.py    # Interactive API credential setup
     │   ├── constants.py         # All configuration constants
     │   ├── data_structures.py   # Shared dataclasses
+    │   ├── db_logger.py         # SQLite logger — all DB writes + maintenance
     │   ├── helpers.py           # Rate limiter, interval parsing, fee lookups
-    │   ├── logger.py            # CSV and order log writers
+    │   ├── logger.py            # Colour-coded console order logger (no file I/O)
     │   ├── plotting.py          # ASCII equity chart + Monte Carlo report
     │   ├── position_gate.py     # Thread-safe slot gate (MAX_SLOTS=1)
     │   └── trading_status.py    # Real-time status monitor (periodic display)
@@ -189,7 +192,7 @@ python main.py --paper --symbols XRPUSDT ETHUSDT
 
 ## Configuration
 
-Default settings live in `POLE_POSITION/utils/constants.py`. You can override most of them with a JSON config file:
+Default settings live in `engine/utils/constants.py`. You can override most of them with a JSON config file:
 
 ```json
 {
@@ -225,6 +228,9 @@ Place the file anywhere and pass it with `--config`.
 | `INIT_TRIALS` | `4000` | Optimiser trials at startup |
 | `REOPT_INTERVAL_SEC` | `28800` | Re-optimise every 8 hours |
 | `LIVE_TP_SCALE` | `0.75` | Server-side TP is placed at 75% of backtested distance |
+| `TIME_TP_HOURS` | `20.0` | Hours after entry before the data-driven time TP kicks in |
+| `TIME_TP_FALLBACK_PCT` | `0.005` | 0.5% fallback TP when the DB has insufficient trade history |
+| `TIME_TP_SCALE` | `0.75` | Scale factor applied to the data-driven average TP % |
 | `FEE_RATE` | `0.00055` | Bybit taker fee rate |
 | `MAKER_FEE_RATE` | `0.0002` | Bybit maker fee rate |
 | `SLIPPAGE_TICKS` | `1` | Slippage ticks applied to simulated fills |
@@ -259,12 +265,31 @@ See **`STRATEGY.md`** for the complete specification including exact formulas an
 
 ## Logs and Output
 
+All data is written to a single SQLite database — no CSV or log files are created.
+
 | Path | Contents |
 |------|---------|
-| `paper_logs/trades.csv` | Every entry and exit with fill prices, PnL, fees, slippage |
-| `paper_logs/params.csv` | Parameter changes from each optimisation run |
-| `paper_logs/orders.log` | Raw order placement log with colour codes |
-| `paper_logs/events.log` | General event log (startup, errors, re-optimisation) |
+| `paper_logs/trading.db` | SQLite database (WAL mode) containing all tables below |
+
+### Database Tables
+
+| Table | Retention | Contents |
+|-------|-----------|---------|
+| `trades` | 365 days | Every entry and exit: fill price, PnL, fees, slippage, exit reason |
+| `orders` | 90 days | Raw order placement log with side, qty, price, status |
+| `params` | 365 days | Parameter set in use after each optimisation run |
+| `signals` | 30 days | Every entry signal: raw band level, final level, blocked_by reason |
+| `candles` | 30 days | Closed candle OHLCV |
+| `candle_analytics` | 30 days | 53-column per-candle diagnostics (bands, ADX, RSI, HV, ATR, etc.) |
+| `positions` | 30 days | Position snapshots |
+| `events` | 60 days | Startup, re-opt, stale candle, skip/fail, TIME_TP computation details |
+| `optimization_runs` | 365 days | Per-run summary: trials, best params, duration |
+| `optimization_trials` | 14 days | Every valid trial from every optimisation run |
+| `monte_carlo_runs` | 365 days | Monte Carlo simulation results |
+| `balance_snapshots` | 90 days | Periodic wallet balance snapshots |
+| `mark_price_ticks` | 3 days | High-frequency mark-price ticks for liquidation monitoring |
+
+DB maintenance (pruning, WAL checkpoint, ANALYZE, VACUUM) runs automatically in a background thread at startup and every 24 hours.
 
 ---
 

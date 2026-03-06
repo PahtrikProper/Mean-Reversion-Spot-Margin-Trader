@@ -36,13 +36,16 @@ from ..utils.constants import (
     COLOR_ENTRY,
     COLOR_EXIT,
     COLOR_ERROR,
-    TRADES_CSV_PATH,
     LIVE_TP_SCALE,
+    TIME_TP_HOURS,
+    TIME_TP_FALLBACK_PCT,
+    TIME_TP_SCALE,
 )
 from ..utils import constants as _C
 from ..utils.data_structures import RealPosition, PendingSignal, EntryParams, ExitParams, MC_MIN_TRADES, MC_SIMS
 from ..utils.position_gate import PositionGate
-from ..utils.logger import log_order, csv_append
+from ..utils.logger import log_order
+from ..utils import db_logger as _db
 from ..utils.helpers import now_ms, interval_minutes, leverage_for, taker_fee_for, maker_fee_for
 from ..utils.trading_status import get_status_monitor
 from ..core.indicators import (
@@ -122,6 +125,7 @@ class LiveRealTrader:
         self._last_entry_fee: float = 0.0  # entry fee stored for accurate exit PnL
         self._min_low_since_entry: Optional[float] = None  # Jason McIntosh trail stop
         self._reopt_running: bool = False  # guard against concurrent reopt threads
+        self._time_tp_applied: bool = False  # True once 12h TP tightening fires
 
         self._recompute_indicators()
 
@@ -217,6 +221,7 @@ class LiveRealTrader:
 
     def on_mark_price_update(self, mark_price: float, ts_utc: str):
         self.mark_price = float(mark_price)
+        _db.log_mark_price_tick(ts_utc=ts_utc, symbol=self.symbol, mark_price=self.mark_price)
 
     # ── Entry execution ────────────────────────────────────────────────────────
 
@@ -224,12 +229,27 @@ class LiveRealTrader:
         """Place a market SHORT entry order."""
         if self.position is not None:
             log.warning(f"[{ts_utc}] Cannot enter — already in position")
+            _db.log_event(ts_utc=ts_utc, level="INFO", event_type="ENTRY_SKIPPED",
+                symbol=self.symbol,
+                message="Entry signal fired but already in position — no pyramiding",
+                detail={"reason": "ALREADY_IN_POSITION", "close": close_price,
+                        "entry_price": self.position.entry_price if self.position else None})
             return
         if self.wallet < MIN_WALLET_USDT:
             log.warning(f"[{ts_utc}] Skipping entry — wallet {self.wallet:.4f} < {MIN_WALLET_USDT}")
+            _db.log_event(ts_utc=ts_utc, level="WARNING", event_type="ENTRY_SKIPPED",
+                symbol=self.symbol,
+                message=f"Wallet {self.wallet:.4f} USDT below minimum {MIN_WALLET_USDT} USDT",
+                detail={"reason": "INSUFFICIENT_WALLET", "wallet": self.wallet,
+                        "min_wallet": MIN_WALLET_USDT, "close": close_price})
             return
         if not self.gate.try_acquire(self.symbol):
             log.warning(f"[{ts_utc}] Skipping entry — gate blocked")
+            _db.log_event(ts_utc=ts_utc, level="WARNING", event_type="ENTRY_SKIPPED",
+                symbol=self.symbol,
+                message="Position gate blocked — another symbol holds the slot",
+                detail={"reason": "GATE_BLOCKED", "close": close_price,
+                        "wallet": self.wallet})
             return
 
         c = close_price
@@ -254,6 +274,11 @@ class LiveRealTrader:
                 log_order(ts_utc=ts_utc, symbol=self.symbol, side="SHORT",
                           qty=qty, price=c, order_type="ENTRY", status="FAILED",
                           order_id=order_id, error="No execution summary")
+                _db.log_event(ts_utc=ts_utc, level="ERROR", event_type="ORDER_NO_SUMMARY",
+                    symbol=self.symbol,
+                    message=f"Entry order {order_id} placed but execution summary missing — gate released",
+                    detail={"order_id": order_id, "side": "SHORT", "qty": qty,
+                            "price": c, "wallet_before": wallet_before})
                 self.gate.release(self.symbol)
                 return
 
@@ -310,6 +335,14 @@ class LiveRealTrader:
                       qty=qty, price=c, order_type="ENTRY", status="FAILED", error=str(e))
             self.gate.release(self.symbol)
             log.error(f"[{ts_utc}] Entry failed: {e}")
+            _db.log_event(ts_utc=ts_utc, level="ERROR", event_type="ENTRY_FAILED",
+                symbol=self.symbol,
+                message=f"Live entry order failed: {e}",
+                detail={"reason": str(e), "close": c, "qty_attempted": qty,
+                        "wallet_before": wallet_before,
+                        "ma_len": self.entry_params.ma_len,
+                        "band_mult": self.entry_params.band_mult,
+                        "tp_pct": self.exit_params.tp_pct})
             # Return here so we never fall through to the post-try position check.
             # The gate was already released above on the failure path.
             return
@@ -342,6 +375,12 @@ class LiveRealTrader:
                           order_type="EXIT", status="FAILED",
                           order_id=order_id, error="No execution summary")
                 log.error(f"[{ts_utc}] Exit order {order_id} has no summary")
+                _db.log_event(ts_utc=ts_utc, level="ERROR", event_type="ORDER_NO_SUMMARY",
+                    symbol=self.symbol,
+                    message=f"Exit order {order_id} placed but execution summary missing",
+                    detail={"order_id": order_id, "reason": reason,
+                            "qty_to_close": qty_to_close, "close_price": close_price,
+                            "entry_price": pos.entry_price})
                 if self.position is None:
                     self.gate.release(self.symbol)
                 return
@@ -366,11 +405,19 @@ class LiveRealTrader:
             self._wallet_at_entry      = None
             self._last_entry_fee       = 0.0
             self._min_low_since_entry  = None   # reset trail stop tracking
+            self._time_tp_applied      = False
         except Exception as e:
             log_order(ts_utc=ts_utc, symbol=self.symbol, side="SHORT",
                       qty=qty_to_close if qty_to_close else qty_abs,
                       price=close_price, order_type="EXIT", status="FAILED", error=str(e))
             log.error(f"[{ts_utc}] Exit order failed: {e}")
+            _db.log_event(ts_utc=ts_utc, level="ERROR", event_type="EXIT_FAILED",
+                symbol=self.symbol,
+                message=f"Live exit order failed: {e}",
+                detail={"reason_str": str(e), "exit_reason": reason,
+                        "close_price": close_price,
+                        "entry_price": entry_price,
+                        "qty_abs": qty_abs})
             try:
                 self._refresh_state()
             except Exception:
@@ -439,6 +486,7 @@ class LiveRealTrader:
         self._wallet_at_entry     = None
         self._last_entry_fee      = 0.0
         self._min_low_since_entry = None   # reset trail stop tracking
+        self._time_tp_applied     = False
 
     # ── Trade log ──────────────────────────────────────────────────────────────
 
@@ -476,21 +524,29 @@ class LiveRealTrader:
             self.realized_pnl_net += pnl_net
             result = "WIN" if win else "LOSS"
 
-        csv_append(TRADES_CSV_PATH, [
-            ts_utc, self.symbol, action, reason, f"{side}_SIGNAL",
-            side, float(qty), float(fill_price),
-            float(qty * fill_price), float(fee),
-            float(entry_price), float(tp_price),
-            float(self.mark_price),
-            float(wallet_before), float(wallet_after),
-            float(pnl_gross), float(pnl_net),
-            float(pnl_net / float(self.leverage)) if self.leverage else 0.0,
-            float(pnl_net / wallet_before * 100.0) if wallet_before > 0 else 0.0,
-            result,
-            self.entry_params.ma_len,
-            float(self.entry_params.band_mult),
-            float(self.exit_params.tp_pct),
-        ])
+        pnl_1x   = float(pnl_net / float(self.leverage)) if self.leverage else 0.0
+        pnl_pct_val = float(pnl_net / wallet_before * 100.0) if wallet_before > 0 else 0.0
+        _db.log_trade(
+            ts_utc=ts_utc, mode="live", symbol=self.symbol, interval=self.interval,
+            action=action, reason=reason, side=side,
+            qty=float(qty), fill_price=float(fill_price),
+            notional=float(qty * fill_price), fee=float(fee),
+            entry_price=float(entry_price), tp_price=float(tp_price),
+            mark_price=float(self.mark_price),
+            wallet_before=float(wallet_before), wallet_after=float(wallet_after),
+            pnl_gross=float(pnl_gross), pnl_net=float(pnl_net),
+            pnl_1x_usdt=pnl_1x, pnl_pct=pnl_pct_val,
+            result=result,
+            ma_len=self.entry_params.ma_len,
+            band_mult=float(self.entry_params.band_mult),
+            tp_pct=float(self.exit_params.tp_pct),
+        )
+        _db.log_balance_snapshot(
+            ts_utc=ts_utc, symbol=self.symbol, event=f"LIVE_{action}",
+            wallet_usdt=float(wallet_after),
+            session_pnl_usdt=float(wallet_after - float(self.initial_wallet)),
+            session_pnl_pct=float((wallet_after - float(self.initial_wallet)) / float(self.initial_wallet) * 100.0) if self.initial_wallet > 0 else 0.0,
+        )
 
         if action == "EXIT":
             pnl_sign = "+" if pnl_net >= 0 else ""
@@ -609,6 +665,7 @@ class LiveRealTrader:
                 leverage=lev, fee_rate=fee, maker_fee_rate=maker_fee,
                 interval_minutes=interval_minutes(self.interval),
                 saved_best=saved_best,
+                db_symbol=self.symbol, db_interval=self.interval, db_trigger="REOPT",
             )
 
             new_entry  = opt["entry_params"]
@@ -631,6 +688,30 @@ class LiveRealTrader:
                 f"MA-len={new_entry.ma_len} "
                 f"BandMult={new_entry.band_mult:.2f}% "
                 f"TP={new_exit.tp_pct*100:.2f}%"
+            )
+
+            _ts_reopt = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
+
+            # DB: MC run
+            if mc_res:
+                _db.log_monte_carlo(
+                    ts_utc=_ts_reopt, symbol=self.symbol, interval=self.interval,
+                    mc_results=mc_res, score=new_mc_score if new_mc_score != float("-inf") else None,
+                )
+
+            # DB: params event
+            _event = "REOPT_ACCEPTED" if new_mc_score > 0 else "REOPT_REJECTED"
+            _db.log_params(
+                ts_utc=_ts_reopt, symbol=self.symbol, interval=self.interval,
+                event=_event,
+                ma_len=new_entry.ma_len, band_mult=new_entry.band_mult, tp_pct=new_exit.tp_pct,
+                mc_score=new_mc_score if new_mc_score != float("-inf") else None,
+                sharpe=new_result.sharpe_ratio,
+                pnl_pct=new_result.pnl_pct,
+                max_drawdown_pct=new_result.max_drawdown_pct,
+                trade_count=new_result.trades,
+                winrate=new_result.winrate,
+                wallet=self.wallet,
             )
 
             if new_mc_score > 0:
@@ -667,6 +748,7 @@ class LiveRealTrader:
         ts_utc  = ts.strftime("%Y-%m-%d %H:%M:%S")
         get_status_monitor().on_candle_received(self.symbol)
 
+        ts_ms = int(candle["start"])
         o   = float(candle["open"])
         h   = float(candle["high"])
         l   = float(candle["low"])
@@ -682,6 +764,13 @@ class LiveRealTrader:
         self.closed_candle_count += 1
         self._maybe_reoptimise()
         self._refresh_state()
+
+        # ── DB: raw candle ──
+        _db.log_candle(
+            ts_utc=ts_utc, ts_ms=ts_ms, symbol=self.symbol,
+            interval=self.interval, price_type="last",
+            o=o, h=h, l=l, c=c, vol=vol,
+        )
 
         # acted: set True after any exit or external-close this candle so we never
         # place an entry on the same candle we just closed a position.
@@ -710,20 +799,132 @@ class LiveRealTrader:
 
         adx_val = float(row["adx"])
         rsi_val = float(row["rsi"]) if not pd.isna(row["rsi"]) else 100.0
+        atr_val = float(row["atr"]) if "atr" in self.df.columns and not pd.isna(row["atr"]) else 0.0
 
         _raw_short = compute_entry_signals_raw(
             current_row=row, prev_row=prev,
             current_high=h, current_low=l,
         )
-        entry_sig = resolve_entry_signals(_raw_short, adx_val, rsi_val) > 0
-        exit_sig  = compute_exit_signals_raw(
+        _final_short = resolve_entry_signals(_raw_short, adx_val, rsi_val)
+        entry_sig = _final_short > 0
+        _raw_exit = compute_exit_signals_raw(
             current_row=row, prev_row=prev,
             current_low=l, current_high=h,
-        ) > 0
+        )
+        exit_sig = _raw_exit > 0
+
+        # ── DB: candle analytics ──
+        _db.log_candle_analytics(
+            ts_utc=ts_utc, symbol=self.symbol, interval=self.interval,
+            df=self.df, mark_price=self.mark_price,
+            ma_len=self.entry_params.ma_len, band_mult=self.entry_params.band_mult,
+        )
+
+        # ── DB: signal ──
+        _trail_stop_lvl = None
+        if self.position is not None and self._min_low_since_entry is not None and atr_val > 0:
+            _trail_stop_lvl = self._min_low_since_entry + float(self.exit_params.trail_atr_mult) * atr_val
+
+        if entry_sig:
+            _sig_type = "ENTRY"
+            _blocked  = None
+        elif _raw_exit > 0:
+            _sig_type = "EXIT_BAND"
+            _blocked  = None
+        elif _trail_stop_lvl is not None and h >= _trail_stop_lvl:
+            _sig_type = "EXIT_TRAIL"
+            _blocked  = None
+        else:
+            _sig_type = "NONE"
+            _blocked  = None
+            if _raw_short > 0 and _final_short == 0:
+                _blocked = "ADX" if adx_val >= 25 else "RSI"
+
+        _db.log_signal(
+            ts_utc=ts_utc, symbol=self.symbol, interval=self.interval,
+            signal_type=_sig_type,
+            raw_band_level=_raw_short, final_band_level=_final_short,
+            adx=adx_val, rsi=rsi_val, atr=atr_val if atr_val else None,
+            trail_stop_level=_trail_stop_lvl,
+            blocked_by=_blocked,
+            o=o, h=h, l=l, c=c,
+            ma_len=self.entry_params.ma_len,
+            band_mult=self.entry_params.band_mult,
+            tp_pct=self.exit_params.tp_pct,
+        )
+
+        # ── DB: position snapshot ──
+        if self.position is not None:
+            _qty_abs  = abs(self.position.qty)
+            _upnl     = (self.position.entry_price - self.mark_price) * _qty_abs
+            _ts_entry = self._entry_time.strftime("%Y-%m-%d %H:%M:%S") if self._entry_time else None
+            _tp_snap  = self._entry_price * (1.0 - float(self.exit_params.tp_pct) * _C.LIVE_TP_SCALE) if self._entry_price else None
+            _db.log_position(
+                ts_utc=ts_utc, symbol=self.symbol,
+                qty=-_qty_abs,
+                entry_price=self.position.entry_price,
+                entry_time=_ts_entry,
+                mark_price=self.mark_price,
+                liquidation_price=self.position.liq_price,
+                unrealized_pnl=_upnl,
+                min_low_since_entry=self._min_low_since_entry,
+                trail_stop_price=_trail_stop_lvl,
+                tp_price=_tp_snap,
+                wallet=self.wallet,
+            )
+        else:
+            _db.log_position(
+                ts_utc=ts_utc, symbol=self.symbol,
+                qty=None, entry_price=None, entry_time=None,
+                mark_price=self.mark_price,
+                liquidation_price=None, unrealized_pnl=None,
+                min_low_since_entry=None, trail_stop_price=None,
+                tp_price=None, wallet=self.wallet,
+            )
 
         # ── Update Jason McIntosh trail stop tracking ──
         if self.position is not None and self._min_low_since_entry is not None:
             self._min_low_since_entry = min(self._min_low_since_entry, l)
+
+        # ── Time-based TP tightening (20h after entry → data-driven tighter TP) ──
+        if (self.position is not None
+                and self._entry_time is not None
+                and not self._time_tp_applied):
+            try:
+                elapsed_sec = (
+                    pd.Timestamp.now(tz="UTC").tz_convert(None)
+                    - self._entry_time.tz_convert(None)
+                ).total_seconds()
+                if elapsed_sec >= TIME_TP_HOURS * 3600:
+                    _dyn_tp_pct = _db.compute_time_tp_pct(
+                        symbol=self.symbol,
+                        min_hold_hours=TIME_TP_HOURS,
+                        fallback_pct=TIME_TP_FALLBACK_PCT,
+                        scale=TIME_TP_SCALE,
+                    )
+                    new_tp = self._format_price(
+                        self.position.entry_price * (1.0 - _dyn_tp_pct)
+                    )
+                    self.client.set_trading_stop(self.symbol, new_tp)
+                    self._time_tp_applied = True
+                    log.info(
+                        f"{COLOR_EXIT}[{ts_utc}] {TIME_TP_HOURS:.0f}h elapsed — "
+                        f"server TP tightened to {new_tp:.8f} ({_dyn_tp_pct*100:.3f}% from entry){COLOR_RESET}"
+                    )
+                    _db.log_event(
+                        ts_utc=ts_utc, level="INFO", event_type="TIME_TP_APPLIED",
+                        symbol=self.symbol,
+                        message=(
+                            f"{TIME_TP_HOURS:.0f}h time TP fired — server target "
+                            f"{new_tp:.8f} ({_dyn_tp_pct*100:.3f}%)"
+                        ),
+                        detail={"entry_price": self.position.entry_price, "new_tp": new_tp,
+                                "elapsed_hours": round(elapsed_sec / 3600, 2),
+                                "time_tp_pct": _dyn_tp_pct,
+                                "is_fallback": _dyn_tp_pct == TIME_TP_FALLBACK_PCT},
+                    )
+            except Exception as _ttp_err:
+                log.warning(f"[{ts_utc}] Time-based TP update failed: {_ttp_err}")
 
         # ── Jason McIntosh trail stop signal ──
         trail_stop_exit = False
@@ -813,6 +1014,9 @@ def start_live_ws(traders: Dict[str, Any], stop_event: threading.Event = None):
         ws.send(json.dumps({"op": "subscribe", "args": topic_k + topic_t}))
         log.info(f"WebSocket connected. Subscribed: {', '.join(topic_k + topic_t)}")
         log.info("Live trading started. Press Ctrl+C to stop.\n")
+        _ts = pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        _db.log_event(ts_utc=_ts, level="INFO", event_type="WS_CONNECTED",
+                      message=f"WebSocket connected. Topics: {', '.join(topic_k + topic_t)}")
 
     def on_message(ws, message):
         last_msg_time["t"] = time.time()
@@ -852,10 +1056,16 @@ def start_live_ws(traders: Dict[str, Any], stop_event: threading.Event = None):
 
     def on_error(ws, error):
         log.error(f"WebSocket error: {error}")
+        _ts = pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        _db.log_event(ts_utc=_ts, level="ERROR", event_type="WS_ERROR",
+                      message=str(error))
 
     def on_close(ws, code, msg):
         _ws_ref["ws"] = None
         log.warning(f"WebSocket closed: {code} {msg}")
+        _ts = pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        _db.log_event(ts_utc=_ts, level="WARNING", event_type="WS_DISCONNECTED",
+                      message=f"WebSocket closed: code={code} msg={msg}")
 
     def run_one():
         ws = WebSocketApp(ws_url, on_open=on_open, on_message=on_message,

@@ -20,6 +20,8 @@ import sys
 import json
 import logging
 import argparse
+import threading
+import time as _time
 from pathlib import Path
 
 # In dev mode, ensure the project root is importable.
@@ -49,24 +51,25 @@ def _setup_platform() -> None:
 
 _setup_platform()
 
-import POLE_POSITION as bot_module
+import engine as bot_module
 
-from POLE_POSITION.utils import constants as const_module
-from POLE_POSITION.utils.constants import (
+from engine.utils import constants as const_module
+from engine.utils.constants import (
     SYMBOLS, CANDLE_INTERVALS, DAYS_BACK_SEED,
     DEFAULT_TP_PCT, MAX_ACTIVE_SYMBOLS,
     PAPER_SYMBOLS, PAPER_STARTING_BALANCE,
 )
-from POLE_POSITION.utils.api_key_prompt import ensure_api_credentials
-from POLE_POSITION.utils.helpers import (
+from engine.utils.api_key_prompt import ensure_api_credentials
+from engine.utils.helpers import (
     leverage_for, taker_fee_for, maker_fee_for, supported_intervals,
 )
-from POLE_POSITION.utils.data_structures import EntryParams, ExitParams
-from POLE_POSITION.trading.paper_trader import _download_seed as _paper_download_seed
+from engine.utils.data_structures import EntryParams, ExitParams
+from engine.trading.paper_trader import _download_seed as _paper_download_seed
+from engine.utils import db_logger as _db
 
 
 class Config:
-    """Load and manage configuration from POLE_POSITION/config/default_config.json"""
+    """Load and manage configuration from engine/config/default_config.json"""
 
     @staticmethod
     def load(config_path=None):
@@ -77,7 +80,7 @@ class Config:
                 script_dir = sys._MEIPASS
             else:
                 script_dir = os.path.dirname(os.path.abspath(__file__))
-            config_path = os.path.join(script_dir, "POLE_POSITION", "config", "default_config.json")
+            config_path = os.path.join(script_dir, "engine", "config", "default_config.json")
         if not os.path.exists(config_path):
             print(f"  Config not found at {config_path}  — using defaults")
             return None
@@ -118,6 +121,12 @@ def run_live_trading():
     print("=" * 65)
     print(f"  Mean Reversion Trader  |  Mean Reversion Strategy  |  {', '.join(const_module.SYMBOLS)}")
     print("=" * 65)
+
+    import pandas as _pd
+    _startup_ts = _pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
+    _db.log_event(ts_utc=_startup_ts, level="INFO", event_type="STARTUP",
+                  message="Live trading session started",
+                  detail={"symbols": const_module.SYMBOLS, "mode": "live"})
 
     symbols   = const_module.SYMBOLS
     intervals = supported_intervals(const_module.CANDLE_INTERVALS)
@@ -167,6 +176,7 @@ def run_live_trading():
                 fee_rate        = taker_fee_for(symbol),
                 maker_fee_rate  = maker_fee_for(symbol),
                 interval_minutes= int(interval),
+                db_symbol=symbol, db_interval=interval, db_trigger="STARTUP",
             )
 
             ep  = opt["entry_params"]
@@ -280,6 +290,13 @@ def run_paper_trading():
     print(f"  Virtual wallet: ${PAPER_STARTING_BALANCE:.0f} USDT  |  Bybit public data only")
     print("=" * 65)
 
+    import pandas as _pd
+    _startup_ts = _pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
+    _db.log_event(ts_utc=_startup_ts, level="INFO", event_type="STARTUP",
+                  message="Paper trading session started",
+                  detail={"symbols": const_module.SYMBOLS, "mode": "paper",
+                          "starting_balance": PAPER_STARTING_BALANCE})
+
     symbols   = const_module.SYMBOLS
     intervals = supported_intervals(const_module.CANDLE_INTERVALS)
     n_top     = const_module.MAX_ACTIVE_SYMBOLS
@@ -328,6 +345,7 @@ def run_paper_trading():
                     fee_rate         = taker_fee_for(symbol),
                     maker_fee_rate   = maker_fee_for(symbol),
                     interval_minutes = int(interval),
+                    db_symbol=symbol, db_interval=interval, db_trigger="STARTUP",
                 )
 
                 ep  = opt["entry_params"]
@@ -432,6 +450,32 @@ def run_paper_trading():
     print("\n  Paper trading stopped.")
 
 
+def _start_maintenance_thread() -> None:
+    """Start a background daemon that runs DB maintenance once at startup
+    then every 24 hours while the process is alive.
+
+    First run is lightweight (no VACUUM) so startup isn't delayed.
+    Subsequent nightly runs include a full VACUUM for deep compaction.
+    """
+    def _loop():
+        # Lightweight sweep at boot — prune stale rows + WAL checkpoint
+        try:
+            _db.run_maintenance(vacuum=False)
+        except Exception as exc:
+            print(f"  [DB] Startup maintenance error: {exc}")
+
+        while True:
+            _time.sleep(86_400)          # 24 hours
+            try:
+                _db.run_maintenance(vacuum=True)   # full nightly clean
+            except Exception as exc:
+                print(f"  [DB] Scheduled maintenance error: {exc}")
+
+    t = threading.Thread(target=_loop, name="db-maintenance", daemon=True)
+    t.start()
+    print("  DB maintenance thread started  (24 h cycle, VACUUM nightly)")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Mean Reversion Trader — Automated Bybit Short-only Trading Bot"
@@ -445,7 +489,7 @@ def main():
     cfg = Config.load(args.config)
     if cfg:
         Config.apply(cfg)
-        src = args.config or "POLE_POSITION/config/default_config.json"
+        src = args.config or "engine/config/default_config.json"
         print(f"    Config loaded from {src}")
     else:
         print("    Using default constants")
@@ -459,6 +503,8 @@ def main():
         format  = "%(message)s",
         handlers= [logging.StreamHandler(sys.stdout)],
     )
+
+    _start_maintenance_thread()
 
     if args.paper:
         print("\n" + "=" * 65)

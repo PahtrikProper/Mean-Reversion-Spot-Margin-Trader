@@ -60,8 +60,8 @@ _GUI_HIDDEN = _COMMON_HIDDEN + [
 # ── Data files to bundle  (source_path, dest_dir_inside_bundle) ──────────────
 _DATA = [
     (
-        os.path.join("POLE_POSITION", "config", "default_config.json"),
-        os.path.join("POLE_POSITION", "config"),
+        os.path.join("engine", "config", "default_config.json"),
+        os.path.join("engine", "config"),
     ),
 ]
 

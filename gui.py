@@ -49,16 +49,16 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 # ── Bot imports ───────────────────────────────────────────────────────────────
-import POLE_POSITION as bot
-from POLE_POSITION.utils import constants as C
-from POLE_POSITION.utils.constants import LIVE_TP_SCALE
-from POLE_POSITION.utils.api_key_prompt import (
+import engine as bot
+from engine.utils import constants as C
+from engine.utils.constants import LIVE_TP_SCALE
+from engine.utils.api_key_prompt import (
     CREDS_FILE,
     _load_credentials,
     _save_credentials,
     validate_api_credentials,
 )
-from POLE_POSITION.utils.helpers import (
+from engine.utils.helpers import (
     leverage_for,
     maker_fee_for,
     supported_intervals,
@@ -68,7 +68,7 @@ from POLE_POSITION.utils.helpers import (
 # ── Config helpers (mirrors main.py Config) ───────────────────────────────────
 def _load_config() -> Optional[dict]:
     base = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(base, "POLE_POSITION", "config", "default_config.json")
+    path = os.path.join(base, "engine", "config", "default_config.json")
     if not os.path.exists(path):
         return None
     try:
@@ -257,7 +257,7 @@ class _BotController:
                 _apply_config(cfg)
 
             # Credentials
-            from POLE_POSITION.utils.api_key_prompt import ensure_api_credentials
+            from engine.utils.api_key_prompt import ensure_api_credentials
             ensure_api_credentials()
 
             symbols   = C.SYMBOLS

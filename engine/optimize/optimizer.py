@@ -23,6 +23,8 @@ import numpy as np
 import logging
 import sys
 import math
+import time
+import uuid
 import pandas as pd
 from typing import Dict, Any, Optional
 from tqdm import tqdm
@@ -40,10 +42,12 @@ from ..utils.constants import (
     EXPLOIT_MA_LEN_RADIUS,
     EXPLOIT_BAND_MULT_RADIUS_X10,
     EXPLOIT_TP_RADIUS_BP,
-    PARAMS_CSV_PATH,
+    TIME_TP_HOURS,
+    TIME_TP_FALLBACK_PCT,
+    TIME_TP_SCALE,
 )
 from ..utils.data_structures import EntryParams, ExitParams
-from ..utils.logger import csv_append
+from ..utils import db_logger as _db
 from ..utils.plotting import plot_pnl_chart
 from ..backtest.backtester import backtest_once
 
@@ -65,6 +69,9 @@ def optimise_params(
     exit_method_lock: Optional[str] = None,  # kept for API compat, unused
     progress_callback=None,
     verbose: bool = True,
+    db_symbol: Optional[str] = None,
+    db_interval: Optional[str] = None,
+    db_trigger: str = "STARTUP",
 ) -> Dict[str, Any]:
     """Random search over (ma_len, band_mult, tp_pct).
 
@@ -152,6 +159,25 @@ def optimise_params(
             print(f"  Mode: {total} fully random")
         print(f"  Min trades filter: {OPT_MIN_TRADES}\n")
 
+    _run_id    = str(uuid.uuid4())
+    _t_start   = time.time()
+
+    # Compute data-driven time TP once for the entire optimisation run.
+    # Uses the same DB query that the live/paper traders call at 20h.
+    _time_tp_pct: float = TIME_TP_FALLBACK_PCT
+    if db_symbol:
+        try:
+            _time_tp_pct = _db.compute_time_tp_pct(
+                symbol=db_symbol,
+                min_hold_hours=TIME_TP_HOURS,
+                fallback_pct=TIME_TP_FALLBACK_PCT,
+                scale=TIME_TP_SCALE,
+            )
+        except Exception as _tte:
+            log.debug(f"[OPT] compute_time_tp_pct failed: {_tte} — using fallback")
+    if verbose:
+        print(f"  Time TP: {_time_tp_pct*100:.3f}% after {TIME_TP_HOURS:.0f}h hold\n")
+
     results = []
     milestone = max(1, total // 10)
     pbar = tqdm(total=total, desc="Optimising", unit="trial", leave=False) if verbose else None
@@ -161,7 +187,11 @@ def optimise_params(
         tp = tp_bp * 0.0001
         ep = EntryParams(ma_len=ma, band_mult=band_mult)
         xp = ExitParams(tp_pct=tp)
-        res = backtest_once(dfl, dfm, risk_df, ep, xp, leverage, fee_rate, maker_fee_rate)
+        res = backtest_once(
+            dfl, dfm, risk_df, ep, xp, leverage, fee_rate, maker_fee_rate,
+            time_tp_pct=_time_tp_pct,
+            interval_minutes_bt=interval_minutes,
+        )
         if pbar:
             pbar.update(1)
         if progress_callback:
@@ -239,19 +269,34 @@ def optimise_params(
                        interval_minutes=interval_minutes)
 
     ts_utc = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
-    csv_append(PARAMS_CSV_PATH, [
-        ts_utc, event_name,
-        best_entry.ma_len, round(best_entry.band_mult, 4),
-        round(best_exit.tp_pct, 6),
-        round(best_res.final_wallet, 6),
-        round(best_res.sharpe_ratio, 6),
-    ])
+
+    # ── DB: log optimization run + trials ─────────────────────────────────────
+    _duration = time.time() - _t_start
+    if db_symbol:
+        try:
+            _db.log_optimization_run(
+                run_id=_run_id, ts_utc=ts_utc,
+                symbol=db_symbol, interval=db_interval or "",
+                trigger=db_trigger,
+                total_trials=total, valid_trials=len(results),
+                duration_sec=_duration,
+                best_ma_len=best_entry.ma_len,
+                best_band_mult=best_entry.band_mult,
+                best_tp_pct=best_exit.tp_pct,
+                best_pnl_pct=best_res.pnl_pct,
+                best_n_losses=best.get("n_losses", 0),
+                accepted=True,
+            )
+            _db.log_optimization_trials(_run_id, results)
+        except Exception as _dbe:
+            log.warning(f"[DB] Optimization logging failed: {_dbe}")
 
     return {
         "entry_params": best_entry,
         "exit_params":  best_exit,
         "best_result":  best_res,
         "all_results":  results,
+        "_run_id":      _run_id,
     }
 
 

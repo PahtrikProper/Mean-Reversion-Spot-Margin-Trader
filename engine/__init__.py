@@ -34,6 +34,6 @@ from .trading.liquidation import pick_risk_tier, liquidation_price_short_isolate
 from .backtest.backtester import backtest_once, run_monte_carlo, mc_score
 from .optimize.optimizer import optimise_params, optimise_bayesian
 
-__version__ = "5.0"
+__version__ = "6.0"
 __author__  = "PahtrikProper"
 __license__ = "MIT"

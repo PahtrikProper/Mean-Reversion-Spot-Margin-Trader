@@ -25,7 +25,7 @@ class TradeRecord:
     exit_fee:        float
     pnl_gross:       float
     pnl_net:         float
-    reason:          str           # "TP", "TRAIL_STOP", "BAND_EXIT", "LIQUIDATION"
+    reason:          str           # "TP", "TIME_TP", "TRAIL_STOP", "BAND_EXIT", "LIQUIDATION"
     wallet_at_entry: float = 0.0
 
     @property
@@ -119,6 +119,7 @@ class RealPosition:
     entry_price: float
     side:        str      # "Buy" or "Sell"
     entry_time:  Optional[object] = None  # pd.Timestamp of entry (tracked locally)
+    liq_price:   Optional[float]  = None  # liquidation price from Bybit (None in paper mode)
 
 
 @dataclass
