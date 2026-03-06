@@ -280,7 +280,7 @@ def run_paper_trading():
     print(f"  Virtual wallet: ${PAPER_STARTING_BALANCE:.0f} USDT  |  Bybit public data only")
     print("=" * 65)
 
-    symbols   = const_module.PAPER_SYMBOLS
+    symbols   = const_module.SYMBOLS
     intervals = supported_intervals(const_module.CANDLE_INTERVALS)
     n_top     = const_module.MAX_ACTIVE_SYMBOLS
 
@@ -451,10 +451,7 @@ def main():
         print("    Using default constants")
 
     if args.symbols:
-        if args.paper:
-            const_module.PAPER_SYMBOLS = args.symbols
-        else:
-            const_module.SYMBOLS = args.symbols
+        const_module.SYMBOLS = args.symbols
         print(f"    Symbols overridden: {args.symbols}")
 
     logging.basicConfig(

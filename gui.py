@@ -436,7 +436,7 @@ class _PaperBotController:
             if cfg:
                 _apply_config(cfg)
 
-            symbols   = C.PAPER_SYMBOLS
+            symbols   = C.SYMBOLS
             intervals = supported_intervals(C.CANDLE_INTERVALS)
             gate      = bot.PositionGate()
 
@@ -1247,7 +1247,7 @@ class App(ctk.CTk):
         C.DEFAULT_LEVERAGE = lev
         # Apply immediately to all configured paper symbols so the
         # liquidation price calculation uses the correct leverage from the start.
-        for sym in C.PAPER_SYMBOLS:
+        for sym in C.SYMBOLS:
             C.LEVERAGE_BY_SYMBOL[sym] = lev
         self._lbl_leverage_status.configure(
             text=f"Current: {int(lev)}x  (paper — live syncs from Bybit)",
