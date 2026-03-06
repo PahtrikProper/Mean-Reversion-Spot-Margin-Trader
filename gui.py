@@ -79,9 +79,15 @@ def _load_config() -> Optional[dict]:
 
 
 def _apply_config(cfg: dict) -> None:
+    """Apply non-symbol config values at bot-run time.
+
+    Symbols are intentionally excluded here — the GUI Symbols field is the
+    sole source of truth.  C.SYMBOLS is seeded once in App.__init__ and
+    updated only by _apply_symbols() / _start_bot().
+    """
     if not cfg:
         return
-    if "symbol"          in cfg: C.SYMBOLS         = [cfg["symbol"]]
+    # NOTE: "symbol" key is intentionally NOT applied here.
     if "leverage"        in cfg: C.DEFAULT_LEVERAGE = float(cfg["leverage"])
     if "starting_wallet" in cfg: C.STARTING_WALLET  = float(cfg["starting_wallet"])
     if "entry" in cfg:
@@ -631,6 +637,18 @@ class App(ctk.CTk):
         logging.getLogger().addHandler(handler)
         logging.getLogger().setLevel(logging.INFO)
 
+        # Seed C.SYMBOLS from the config file BEFORE building the UI so the
+        # Symbols entry field shows the correct default.  The GUI is the sole
+        # source of truth for symbols at runtime — _apply_config() no longer
+        # overwrites C.SYMBOLS during a bot run.
+        _early_cfg = _load_config()
+        if _early_cfg:
+            if "symbol" in _early_cfg:
+                C.SYMBOLS       = [_early_cfg["symbol"]]
+                C.PAPER_SYMBOLS = [_early_cfg["symbol"]]
+            if "leverage"        in _early_cfg: C.DEFAULT_LEVERAGE = float(_early_cfg["leverage"])
+            if "starting_wallet" in _early_cfg: C.STARTING_WALLET  = float(_early_cfg["starting_wallet"])
+
         self._build_ui()
         self._load_saved_keys()
         self._poll()
@@ -831,10 +849,15 @@ class App(ctk.CTk):
             _cb = ctk.CTkCheckBox(
                 iv_frame, text=_lbl, variable=_var, width=65,
                 font=ctk.CTkFont(size=13),
-                command=self._apply_intervals,
             )
             _cb.pack(side="left", padx=(0, 4))
             self._iv_checks.append(_cb)
+
+        self._btn_apply_intervals = ctk.CTkButton(
+            iv_frame, text="Apply", width=80,
+            command=self._apply_intervals,
+        )
+        self._btn_apply_intervals.pack(side="left", padx=(8, 0))
 
         # ── Symbols row ───────────────────────────────────────────────────────
         ctk.CTkLabel(
@@ -1305,6 +1328,7 @@ class App(ctk.CTk):
         self._btn_apply_tests.configure(state="disabled")
         for _cb in self._iv_checks:
             _cb.configure(state="disabled")
+        self._btn_apply_intervals.configure(state="disabled")
         self._symbols_entry.configure(state="disabled")
         self._btn_apply_symbols.configure(state="disabled")
         self._leverage_menu.configure(state="disabled")
@@ -1313,6 +1337,9 @@ class App(ctk.CTk):
         self._prog_bar.set(0)
 
         self._running = True
+        # Lock in whatever is currently in the Symbols entry field so the bot
+        # thread sees the user's selection even if they didn't click Apply.
+        self._apply_symbols()
         if self._mode == "PAPER":
             self._ctrl = _PaperBotController(self._q, self._stop_evt)
         else:
@@ -1392,6 +1419,7 @@ class App(ctk.CTk):
             self._btn_apply_tests.configure(state="normal")
             for _cb in self._iv_checks:
                 _cb.configure(state="normal")
+            self._btn_apply_intervals.configure(state="normal")
             self._symbols_entry.configure(state="normal")
             self._btn_apply_symbols.configure(state="normal")
             self._leverage_menu.configure(state="normal")
