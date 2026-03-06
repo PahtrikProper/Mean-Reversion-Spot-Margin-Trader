@@ -839,7 +839,7 @@ class App(ctk.CTk):
         ).grid(row=3, column=0, padx=(14, 8), pady=(0, 12), sticky="w")
 
         iv_frame = ctk.CTkFrame(self._risk_body, fg_color="transparent")
-        iv_frame.grid(row=3, column=1, columnspan=3, sticky="w", pady=(0, 12))
+        iv_frame.grid(row=3, column=1, columnspan=2, sticky="w", pady=(0, 12))
 
         self._iv_vars: dict = {}
         self._iv_checks: list = []
@@ -858,6 +858,13 @@ class App(ctk.CTk):
             command=self._apply_intervals,
         )
         self._btn_apply_intervals.pack(side="left", padx=(8, 0))
+
+        self._lbl_intervals_status = ctk.CTkLabel(
+            self._risk_body,
+            text=f"Current: {', '.join(iv + 'm' for iv in C.CANDLE_INTERVALS)}",
+            text_color="#8b949e", font=ctk.CTkFont(size=12),
+        )
+        self._lbl_intervals_status.grid(row=3, column=3, padx=14, pady=(0, 12), sticky="w")
 
         # ── Symbols row ───────────────────────────────────────────────────────
         ctk.CTkLabel(
@@ -1259,6 +1266,10 @@ class App(ctk.CTk):
         )
         if selected:
             C.CANDLE_INTERVALS = selected
+            self._lbl_intervals_status.configure(
+                text=f"Current: {', '.join(iv + 'm' for iv in selected)}",
+                text_color="#3fb950",
+            )
 
     def _apply_symbols(self) -> None:
         raw = self._symbols_entry.get().strip()
