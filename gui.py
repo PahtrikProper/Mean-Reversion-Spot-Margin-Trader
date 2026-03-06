@@ -265,12 +265,22 @@ class _BotController:
             client    = bot.BybitPrivateClient()
             gate      = bot.PositionGate()
 
-            # Sync leverage
+            # Sync leverage — fetch actual setting from Bybit and log it clearly
+            # so the user can see exactly what leverage the live backtest uses.
             self._log("Verifying account settings…")
+            _gui_lev = C.DEFAULT_LEVERAGE   # capture GUI/config value before overwrite
             for sym in symbols:
                 lev = client.get_leverage(sym)
                 C.LEVERAGE_BY_SYMBOL[sym] = lev
                 C.DEFAULT_LEVERAGE        = lev
+                self._log(f"{sym}: Bybit leverage = {lev:.0f}x")
+                if abs(lev - _gui_lev) > 0.5:
+                    self._log(
+                        f"⚠️  Leverage mismatch — Bybit returned {lev:.0f}x "
+                        f"but GUI/config had {_gui_lev:.0f}x. "
+                        f"Set leverage to {_gui_lev:.0f}x on Bybit for {sym} "
+                        f"to match your paper backtest."
+                    )
 
             # ── Optimisation phase ────────────────────────────────────────────
             n_pairs  = len(symbols) * len(intervals)
@@ -444,6 +454,7 @@ class _PaperBotController:
             # Always overwrite — do not skip if a prior live session set a different value.
             for sym in symbols:
                 C.LEVERAGE_BY_SYMBOL[sym] = C.DEFAULT_LEVERAGE
+                self._log(f"{sym}: paper leverage = {C.DEFAULT_LEVERAGE:.0f}x")
 
             n_pairs  = len(symbols) * len(intervals)
             pair_idx = 0
