@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Scheduled Market Analysis — reads symbol from engine/config/default_config.json,
-runs full optimisation + signal scan across all configured intervals, and prints
-a ranked summary report.
+runs full optimisation + signal scan across all configured intervals, prints a
+ranked summary report, and saves the best params so the bot warm-starts from them.
 
 Usage:
     python scripts/run_analysis.py                # one-shot
@@ -11,7 +11,7 @@ Usage:
 
 Cron (every 8 hours):
     0 */8 * * * cd "/Users/partyproper/Documents/Mean Reversion Trader" &&
-        /usr/bin/python3 scripts/run_analysis.py >> data/analysis.log 2>&1
+        /opt/homebrew/bin/python3 scripts/run_analysis.py >> data/analysis.log 2>&1
 """
 
 import sys
@@ -37,12 +37,13 @@ import pandas as pd
 import numpy as np
 
 
-# ── config loader ────────────────────────────────────────────────────────────
-CONFIG_PATH = os.path.join(PROJECT_ROOT, "engine", "config", "default_config.json")
+# ── paths ────────────────────────────────────────────────────────────────────
+CONFIG_PATH      = os.path.join(PROJECT_ROOT, "engine", "config", "default_config.json")
+BEST_PARAMS_PATH = os.path.join(PROJECT_ROOT, "data", "best_params.json")
 
 
+# ── config helpers ────────────────────────────────────────────────────────────
 def load_config():
-    """Read engine/config/default_config.json and return parsed dict (or {})."""
     try:
         with open(CONFIG_PATH, "r") as f:
             return json.load(f)
@@ -52,22 +53,59 @@ def load_config():
 
 
 def get_symbol_from_config():
-    cfg = load_config()
-    return cfg.get("symbol", "BTCUSDT")
+    return load_config().get("symbol", "BTCUSDT")
 
 
 def get_intervals_from_config():
-    # Candle intervals come from constants, not config — keep in sync with bot
     from engine.utils import constants as C
     return getattr(C, "CANDLE_INTERVALS", ["1", "3", "5"])
 
 
+def save_best_params(best: dict):
+    """
+    Write best params to data/best_params.json AND update default_config.json
+    entry/exit/interval sections so the bot warm-starts from them.
+    """
+    os.makedirs(os.path.dirname(BEST_PARAMS_PATH), exist_ok=True)
+
+    payload = {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "symbol":    best["symbol"],
+        "interval":  best["interval"],
+        "ma_len":    best["ma_len"],
+        "band_mult": best["band_mult"],
+        "tp_pct":    best["tp_pct"],
+        "trades":    best["trades"],
+        "win_rate":  best["win_rate"],
+        "pnl_pct":   best["pnl_pct"],
+        "max_dd":    best["max_dd"],
+        "score":     best.get("score", 0),
+        "avg_adx":   best.get("avg_adx", 0),
+        "max_adx":   best.get("max_adx", 0),
+        "fired":     best.get("fired", 0),
+        "adx_blocked": best.get("adx_blocked", 0),
+    }
+    with open(BEST_PARAMS_PATH, "w") as f:
+        json.dump(payload, f, indent=2)
+
+    # ── also patch default_config.json so bot fallback defaults are up to date ─
+    try:
+        cfg = load_config()
+        cfg.setdefault("entry", {})["ma_len"]    = best["ma_len"]
+        cfg.setdefault("entry", {})["band_mult"]  = round(best["band_mult"], 4)
+        cfg.setdefault("exit",  {})["tp_pct"]     = round(best["tp_pct"], 6)
+        cfg["interval"] = best["interval"]
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(cfg, f, indent=2)
+        print(f"  ✔  Params saved → data/best_params.json  +  default_config.json updated")
+        print(f"     interval={best['interval']}m  MA={best['ma_len']}  "
+              f"BandMult={best['band_mult']:.4f}%  TP={best['tp_pct']*100:.4f}%")
+    except Exception as e:
+        print(f"  [WARN] Could not update config: {e}")
+
+
 # ── single-interval analysis ─────────────────────────────────────────────────
 def analyse_interval(symbol: str, interval: str, days: int = 1, trials: int = 4000):
-    """
-    Download data, optimise, scan signals.
-    Returns a result dict or None on failure.
-    """
     end_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = end_ms - int(days * 24 * 60 * 60 * 1000)
 
@@ -91,6 +129,18 @@ def analyse_interval(symbol: str, interval: str, days: int = 1, trials: int = 40
     ts_from = df_last.index[0].strftime("%Y-%m-%d %H:%M") if hasattr(df_last.index[0], "strftime") else str(df_last.index[0])
     ts_to   = df_last.index[-1].strftime("%Y-%m-%d %H:%M") if hasattr(df_last.index[-1], "strftime") else str(df_last.index[-1])
 
+    # ── warm-start from previous best if same symbol/interval ───────────────
+    saved_best = None
+    try:
+        if os.path.exists(BEST_PARAMS_PATH):
+            with open(BEST_PARAMS_PATH) as f:
+                prev = json.load(f)
+            if prev.get("symbol") == symbol and prev.get("interval") == interval:
+                saved_best = prev
+                print(f"    → Warm-starting from previous best (MA={prev['ma_len']} BM={prev['band_mult']:.4f}%)")
+    except Exception:
+        pass
+
     print(f"    → Optimising {trials} trials …", flush=True)
     try:
         opt = optimise_params(
@@ -101,6 +151,7 @@ def analyse_interval(symbol: str, interval: str, days: int = 1, trials: int = 40
             fee_rate=taker_fee_for(symbol),
             maker_fee_rate=maker_fee_for(symbol),
             interval_minutes=int(interval),
+            saved_best=saved_best,
             verbose=False,
         )
     except RuntimeError as e:
@@ -188,7 +239,7 @@ def run_analysis(symbol: str, days: int = 1, trials: int = 4000):
         if res:
             results.append(res)
         print()
-        time.sleep(1.0)   # rate-limit guard between intervals
+        time.sleep(1.0)
 
     # ── ranked summary ───────────────────────────────────────────────────────
     print("=" * 65)
@@ -197,7 +248,7 @@ def run_analysis(symbol: str, days: int = 1, trials: int = 4000):
     print(f"  {'IV':>3}  {'MA':>4}  {'BM%':>5}  {'TP%':>6}  {'Tr':>3}  {'WR%':>6}  {'PnL%':>7}  {'DD%':>6}  {'Sig':>4}  {'ADXblk':>7}  {'Fired':>6}")
     print("  " + "-" * 62)
 
-    valid = [r for r in results if "error" not in r]
+    valid  = [r for r in results if "error" not in r]
     failed = [r for r in results if "error" in r]
 
     valid.sort(key=lambda r: r.get("score", -999), reverse=True)
@@ -221,12 +272,16 @@ def run_analysis(symbol: str, days: int = 1, trials: int = 4000):
         best = valid[0]
         print()
         print(f"  ★  BEST INTERVAL: {best['interval']}m  |  "
-              f"MA={best['ma_len']}  BandMult={best['band_mult']:.2f}%  TP={best['tp_pct']*100:.2f}%")
+              f"MA={best['ma_len']}  BandMult={best['band_mult']:.4f}%  TP={best['tp_pct']*100:.4f}%")
         print(f"     Trades={best['trades']}  WR={best['win_rate']*100:.1f}%  "
               f"PnL={best['pnl_pct']*100:+.2f}%  MaxDD={best['max_dd']*100:.1f}%")
         print(f"     Signals fired={best['fired']} / raw={best['raw_signals']}  "
               f"(ADX blocked={best['adx_blocked']}, RSI blocked={best['rsi_blocked']})")
         print(f"     Avg ADX={best['avg_adx']:.1f}  Max ADX={best['max_adx']:.1f}")
+        print()
+
+        # ── save best params so bot can warm-start from them ────────────────
+        save_best_params(best)
 
     for r in failed:
         print(f"  ✗  {r['interval']}m  FAILED: {r['error']}")
@@ -255,10 +310,9 @@ def main():
         print(f"  Loop mode: every {args.hours:.1f} hours  (Ctrl-C to stop)")
         while True:
             run_analysis(symbol, days=args.days, trials=args.trials)
-            # Re-read symbol from config each cycle so GUI changes are picked up
-            symbol = args.symbol or get_symbol_from_config()
+            symbol    = args.symbol or get_symbol_from_config()
             sleep_sec = int(args.hours * 3600)
-            wake_at   = datetime.now(timezone.utc).fromtimestamp(
+            wake_at   = datetime.fromtimestamp(
                 time.time() + sleep_sec, tz=timezone.utc
             ).strftime("%Y-%m-%d %H:%M UTC")
             print(f"  Next run at {wake_at}  (sleeping {args.hours:.1f}h) …\n")

@@ -67,6 +67,36 @@ from engine.utils.data_structures import EntryParams, ExitParams
 from engine.trading.paper_trader import _download_seed as _paper_download_seed
 from engine.utils import db_logger as _db
 
+# ── Agent best-params warm-start helper ──────────────────────────────────────
+_BEST_PARAMS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "best_params.json")
+_BEST_PARAMS_MAX_AGE_SEC = 12 * 3600   # treat analysis as fresh for 12 h
+
+def _load_agent_best_params(symbol: str, interval: str):
+    """
+    Return the saved best-params dict if data/best_params.json exists, is < 12h
+    old, and matches the requested symbol+interval.  Otherwise return None.
+    The dict is passed as saved_best to the optimizer so it warm-starts around
+    the agent's proven params (60 % exploitation).
+    """
+    try:
+        if not os.path.exists(_BEST_PARAMS_PATH):
+            return None
+        with open(_BEST_PARAMS_PATH) as f:
+            bp = json.load(f)
+        if bp.get("symbol") != symbol or bp.get("interval") != interval:
+            return None
+        ts = bp.get("timestamp_utc", "")
+        from datetime import datetime, timezone as _tz
+        saved_at = datetime.fromisoformat(ts)
+        age_sec  = (datetime.now(_tz.utc) - saved_at).total_seconds()
+        if age_sec > _BEST_PARAMS_MAX_AGE_SEC:
+            return None
+        print(f"    ★ Warm-starting from agent analysis  "
+              f"(age {age_sec/3600:.1f}h  MA={bp['ma_len']}  BM={bp['band_mult']:.4f}%)")
+        return bp
+    except Exception:
+        return None
+
 
 class Config:
     """Load and manage configuration from engine/config/default_config.json"""
@@ -177,6 +207,7 @@ def run_live_trading():
                 fee_rate        = taker_fee_for(symbol),
                 maker_fee_rate  = maker_fee_for(symbol),
                 interval_minutes= int(interval),
+                saved_best      = _load_agent_best_params(symbol, interval),
                 db_symbol=symbol, db_interval=interval, db_trigger="STARTUP",
             )
 
@@ -346,6 +377,7 @@ def run_paper_trading():
                     fee_rate         = taker_fee_for(symbol),
                     maker_fee_rate   = maker_fee_for(symbol),
                     interval_minutes = int(interval),
+                    saved_best       = _load_agent_best_params(symbol, interval),
                     db_symbol=symbol, db_interval=interval, db_trigger="STARTUP",
                 )
 

@@ -96,6 +96,48 @@ for i in range(1, len(df)):
         else: rsi_blocked += 1
 ```
 
+## After every analysis — ALWAYS save best params back to bot
+After finding the best interval + params, ALWAYS run this to update the bot:
+```python
+import json, os
+from datetime import datetime, timezone
+
+BEST_PARAMS_PATH = "/Users/partyproper/Documents/Mean Reversion Trader/data/best_params.json"
+CONFIG_PATH      = "/Users/partyproper/Documents/Mean Reversion Trader/engine/config/default_config.json"
+
+os.makedirs(os.path.dirname(BEST_PARAMS_PATH), exist_ok=True)
+
+payload = {
+    "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    "symbol":    best["symbol"],
+    "interval":  best["interval"],
+    "ma_len":    best["ma_len"],
+    "band_mult": best["band_mult"],
+    "tp_pct":    best["tp_pct"],
+    "trades":    best["trades"],
+    "win_rate":  best["win_rate"],
+    "pnl_pct":   best["pnl_pct"],
+    "max_dd":    best["max_dd"],
+    "score":     best.get("score", 0),
+    "avg_adx":   best.get("avg_adx", 0),
+    "fired":     best.get("fired", 0),
+    "adx_blocked": best.get("adx_blocked", 0),
+}
+with open(BEST_PARAMS_PATH, "w") as f:
+    json.dump(payload, f, indent=2)
+
+# Patch default_config.json so bot fallback defaults + interval are up to date
+cfg = json.load(open(CONFIG_PATH))
+cfg.setdefault("entry", {})["ma_len"]   = best["ma_len"]
+cfg.setdefault("entry", {})["band_mult"] = round(best["band_mult"], 4)
+cfg.setdefault("exit",  {})["tp_pct"]   = round(best["tp_pct"], 6)
+cfg["interval"] = best["interval"]
+with open(CONFIG_PATH, "w") as f:
+    json.dump(cfg, f, indent=2)
+
+print(f"✔ Params saved. Bot will warm-start from MA={best['ma_len']} BM={best['band_mult']:.4f}% on next launch.")
+```
+
 ## Output format
 Always report clearly:
 - Symbol, interval, date range, candle count
@@ -103,7 +145,8 @@ Always report clearly:
 - Backtest result: trades, WR%, PnL%, max DD%
 - Signal scan: raw crossovers, ADX blocked, RSI blocked, would-have-traded
 - Avg/max ADX over the period
-- Any notable patterns or recommendations
+- **Intelligent reasoning**: explain WHY these params work (regime, ADX profile, signal frequency)
+- **Recommendation**: suggest if params look robust or fragile, and whether to widen the search
 
 Add `time.sleep(0.5)` between API calls to avoid rate limits.
 If optimisation fails with RuntimeError (no valid runs), report it clearly and suggest trying a longer window or different symbol.
