@@ -102,6 +102,28 @@ def _apply_config(cfg: dict) -> None:
             C.INIT_TRIALS = int(cfg["optimizer"]["n_trials"])
 
 
+# ── Agent best-params warm-start helper ──────────────────────────────────────
+_BEST_PARAMS_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "best_params.json")
+_AGENT_PARAMS_MAX_AGE = 12 * 3600   # treat agent analysis as fresh for 12 h
+
+def _load_agent_best_params(symbol: str, interval: str) -> Optional[dict]:
+    """Return saved best-params if file exists, is < 12 h old, and matches symbol+interval."""
+    try:
+        if not os.path.exists(_BEST_PARAMS_PATH):
+            return None
+        with open(_BEST_PARAMS_PATH) as f:
+            bp = json.load(f)
+        if bp.get("symbol") != symbol or bp.get("interval") != interval:
+            return None
+        from datetime import timezone as _tz
+        saved_at = datetime.fromisoformat(bp["timestamp_utc"])
+        if (datetime.now(_tz.utc) - saved_at).total_seconds() > _AGENT_PARAMS_MAX_AGE:
+            return None
+        return bp
+    except Exception:
+        return None
+
+
 # ── Log filter — blocks ALL strategy/IP details from reaching the GUI ─────────
 #
 # Any log line containing one of these strings is silently dropped.
@@ -296,6 +318,11 @@ class _BotController:
             pair_idx = 0
             results: Dict = {}
 
+            self._emit("agent",
+                       f"🤖  Agent analysis starting — {', '.join(symbols)}  "
+                       f"[{', '.join(intervals)}m]  ·  {C.INIT_TRIALS} trials each",
+                       "Initialising…")
+
             for sym in symbols:
                 if self._stop.is_set():
                     break
@@ -307,13 +334,23 @@ class _BotController:
 
                     pair_idx += 1
                     self._log(f"Downloading market data for {sym}…")
+                    self._emit("agent",
+                               f"  Downloading {sym} {iv}m seed data…",
+                               f"Downloading {iv}m…")
                     df_last, df_mark = bot.download_seed_history(sym, C.DAYS_BACK_SEED, iv)
                     self._log(f"Market data ready ({len(df_last)} candles)")
 
                     self._emit("status", "optimizing")
-                    self._log(
-                        f"Testing {sym} {iv}m — leverage = {leverage_for(sym):.0f}x"
-                    )
+                    self._emit("agent",
+                               f"  Optimising {sym} {iv}m  ({len(df_last)} candles)  …",
+                               f"Optimising {iv}m…")
+
+                    # warm-start from agent's saved params if fresh
+                    _saved = _load_agent_best_params(sym, iv)
+                    if _saved:
+                        self._emit("agent",
+                                   f"  ↳ Warm-starting from previous agent params  "
+                                   f"MA={_saved['ma_len']}  BM={_saved['band_mult']:.4f}%")
 
                     # closure to capture loop vars
                     def _make_cb(pidx: int, n_pairs: int) -> Any:
@@ -335,13 +372,21 @@ class _BotController:
                         fee_rate=taker_fee_for(sym),
                         maker_fee_rate=maker_fee_for(sym),
                         interval_minutes=int(iv),
+                        saved_best=_saved,
                         progress_callback=_make_cb(pair_idx, n_pairs),
                         verbose=False,
                     )
 
+                    ep = opt["entry_params"]
+                    xp = opt["exit_params"]
                     br = opt["best_result"]
                     pf = br.pnl_pct / (1.0 + max(br.max_drawdown_pct, 0.001))
                     self._log("Market analysis complete.")
+                    self._emit("agent",
+                               f"  {iv}m  →  MA={ep.ma_len}  BandMult={ep.band_mult:.2f}%  "
+                               f"TP={xp.tp_pct*100:.3f}%  │  "
+                               f"Trades={br.trades}  WR={br.winrate:.0f}%  "
+                               f"PnL={br.pnl_pct:+.2f}%  Score={pf:.4f}")
 
                     results[(sym, iv)] = {
                         **opt,
@@ -377,6 +422,13 @@ class _BotController:
                 _br = _d["best_result"]
                 _n_wins   = sum(1 for t in _br.trade_records if t.pnl_net > 0)
                 _n_losses = sum(1 for t in _br.trade_records if t.pnl_net < 0)
+                self._emit("agent",
+                           f"★  BEST: {_d['interval']}m  │  "
+                           f"MA={_ep.ma_len}  BandMult={_ep.band_mult:.2f}%  "
+                           f"TP={_xp.tp_pct*100:.3f}%  │  "
+                           f"Trades={_br.trades}  WR={_br.winrate:.0f}%  "
+                           f"PnL={_br.pnl_pct:+.2f}%  Score={_d['score']:.4f}",
+                           f"Best: {_d['interval']}m")
                 self._emit("best_params", {
                     "ma_len":     _ep.ma_len,
                     "band_mult":  _ep.band_mult,
@@ -411,6 +463,9 @@ class _BotController:
             self._emit("progress", 1.0, "")
             syms_str = ", ".join(traders.keys())
             self._log(f"Live trading active — {syms_str}")
+            self._emit("agent",
+                       f"🟢  Trading live — {syms_str}  │  Agent monitoring active",
+                       "Trading")
 
             # ── Blocking WebSocket loop ───────────────────────────────────────
             bot.start_live_ws(traders, stop_event=self._stop)
@@ -472,6 +527,11 @@ class _PaperBotController:
             pair_idx = 0
             results: Dict = {}
 
+            self._emit("agent",
+                       f"🤖  Agent analysis starting (PAPER) — {', '.join(symbols)}  "
+                       f"[{', '.join(intervals)}m]  ·  {C.INIT_TRIALS} trials each",
+                       "Initialising…")
+
             for sym in symbols:
                 if self._stop.is_set():
                     break
@@ -480,6 +540,7 @@ class _PaperBotController:
                     instrument = bot.get_instrument_info(sym)
                 except Exception as exc:
                     self._log(f"Skipping {sym}: {exc}")
+                    self._emit("agent", f"  ✗  {sym}: {exc}")
                     continue
 
                 for iv in intervals:
@@ -488,13 +549,23 @@ class _PaperBotController:
                     try:
                         pair_idx += 1
                         self._log(f"Downloading market data for {sym}…")
+                        self._emit("agent",
+                                   f"  Downloading {sym} {iv}m seed data…",
+                                   f"Downloading {iv}m…")
                         df_last, df_mark = bot.download_seed_history(sym, C.DAYS_BACK_SEED, iv)
                         self._log(f"Market data ready ({len(df_last)} candles)")
 
                         self._emit("status", "optimizing")
-                        self._log(
-                            f"Testing {sym} {iv}m — leverage = {leverage_for(sym):.0f}x"
-                        )
+                        self._emit("agent",
+                                   f"  Optimising {sym} {iv}m  ({len(df_last)} candles)  …",
+                                   f"Optimising {iv}m…")
+
+                        # warm-start from agent's saved params if fresh
+                        _saved = _load_agent_best_params(sym, iv)
+                        if _saved:
+                            self._emit("agent",
+                                       f"  ↳ Warm-starting from previous agent params  "
+                                       f"MA={_saved['ma_len']}  BM={_saved['band_mult']:.4f}%")
 
                         def _make_cb(pidx: int, npairs: int) -> Any:
                             def cb(done: int, total: int) -> None:
@@ -515,13 +586,21 @@ class _PaperBotController:
                             fee_rate=taker_fee_for(sym),
                             maker_fee_rate=maker_fee_for(sym),
                             interval_minutes=int(iv),
+                            saved_best=_saved,
                             progress_callback=_make_cb(pair_idx, n_pairs),
                             verbose=False,
                         )
 
+                        ep = opt["entry_params"]
+                        xp = opt["exit_params"]
                         br = opt["best_result"]
                         pf = br.pnl_pct / (1.0 + max(br.max_drawdown_pct, 0.001))
                         self._log("Market analysis complete.")
+                        self._emit("agent",
+                                   f"  {iv}m  →  MA={ep.ma_len}  BandMult={ep.band_mult:.2f}%  "
+                                   f"TP={xp.tp_pct*100:.3f}%  │  "
+                                   f"Trades={br.trades}  WR={br.winrate:.0f}%  "
+                                   f"PnL={br.pnl_pct:+.2f}%  Score={pf:.4f}")
 
                         results[(sym, iv)] = {
                             **opt,
@@ -534,6 +613,7 @@ class _PaperBotController:
                         }
                     except Exception as exc:
                         self._log(f"Skipping {sym} {iv}m: {exc}")
+                        self._emit("agent", f"  ✗  {sym} {iv}m: {exc}")
 
             if self._stop.is_set():
                 self._emit("status", "idle")
@@ -564,6 +644,13 @@ class _PaperBotController:
                 _br = _d["best_result"]
                 _n_wins   = sum(1 for t in _br.trade_records if t.pnl_net > 0)
                 _n_losses = sum(1 for t in _br.trade_records if t.pnl_net < 0)
+                self._emit("agent",
+                           f"★  BEST: {_d['interval']}m  │  "
+                           f"MA={_ep.ma_len}  BandMult={_ep.band_mult:.2f}%  "
+                           f"TP={_xp.tp_pct*100:.3f}%  │  "
+                           f"Trades={_br.trades}  WR={_br.winrate:.0f}%  "
+                           f"PnL={_br.pnl_pct:+.2f}%  Score={_d['score']:.4f}",
+                           f"Best: {_d['interval']}m")
                 self._emit("best_params", {
                     "ma_len":       _ep.ma_len,
                     "band_mult":    _ep.band_mult,
@@ -596,6 +683,9 @@ class _PaperBotController:
             self._emit("progress", 1.0, "")
             syms_str = ", ".join(traders.keys())
             self._log(f"Paper trading active — {syms_str}  (virtual $500 USDT wallet)")
+            self._emit("agent",
+                       f"🟡  Paper trading — {syms_str}  │  Agent monitoring active",
+                       "Paper trading")
 
             bot.start_live_ws(traders, stop_event=self._stop)
 
@@ -623,8 +713,8 @@ class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Mean Reversion Trader")
-        self.geometry("980x920")
-        self.minsize(820, 720)
+        self.geometry("980x1060")
+        self.minsize(820, 820)
         self.resizable(True, True)
 
         self._q        = queue.Queue()
@@ -660,9 +750,10 @@ class App(ctk.CTk):
     # ── UI Construction ───────────────────────────────────────────────────────
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
-        # Row weights: trades table (10) and log (12) expand
+        # Row weights: trades table (10), agent panel (12), activity log (14) expand
         self.grid_rowconfigure(10, weight=1)
-        self.grid_rowconfigure(12, weight=2)
+        self.grid_rowconfigure(12, weight=1)
+        self.grid_rowconfigure(14, weight=1)
 
         # ── Header ────────────────────────────────────────────────────────────
         hdr = ctk.CTkFrame(self, height=60, fg_color="#0d1117", corner_radius=0)
@@ -1114,9 +1205,33 @@ class App(ctk.CTk):
         self._tree.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=6)
         vsb.grid(row=0, column=1, sticky="ns", pady=6, padx=(0, 4))
 
+        # ── Agent analysis panel header ───────────────────────────────────────
+        agent_hdr = ctk.CTkFrame(self, fg_color="#161b22", corner_radius=0, height=32)
+        agent_hdr.grid(row=11, column=0, sticky="ew", padx=10, pady=(0, 0))
+        agent_hdr.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(
+            agent_hdr, text="🤖  AGENT ANALYSIS",
+            font=ctk.CTkFont(size=11, weight="bold"), text_color="#58a6ff",
+        ).pack(side="left", padx=14, pady=(8, 4))
+        self._lbl_agent_phase = ctk.CTkLabel(
+            agent_hdr, text="",
+            font=ctk.CTkFont(size=11), text_color="#8b949e",
+        )
+        self._lbl_agent_phase.pack(side="left", padx=(0, 14), pady=(8, 4))
+
+        # ── Agent analysis log ────────────────────────────────────────────────
+        self._agent_box = ctk.CTkTextbox(
+            self, height=120,
+            font=ctk.CTkFont(family="Courier New" if sys.platform == "win32" else "Courier", size=11),
+            fg_color="#0d1117", text_color="#79c0ff",
+            corner_radius=8,
+        )
+        self._agent_box.grid(row=12, column=0, sticky="nsew", padx=10, pady=(0, 6))
+        self._agent_box.configure(state="disabled")
+
         # ── Activity log header ───────────────────────────────────────────────
         log_hdr = ctk.CTkFrame(self, fg_color="#161b22", corner_radius=0, height=32)
-        log_hdr.grid(row=11, column=0, sticky="ew", padx=10, pady=(0, 0))
+        log_hdr.grid(row=13, column=0, sticky="ew", padx=10, pady=(0, 0))
         ctk.CTkLabel(
             log_hdr, text="ACTIVITY",
             font=ctk.CTkFont(size=11, weight="bold"), text_color="#8b949e",
@@ -1124,12 +1239,12 @@ class App(ctk.CTk):
 
         # ── Activity log ──────────────────────────────────────────────────────
         self._log_box = ctk.CTkTextbox(
-            self, height=140,
+            self, height=120,
             font=ctk.CTkFont(family="Courier New" if sys.platform == "win32" else "Courier", size=11),
             fg_color="#0d1117", text_color="#c9d1d9",
             corner_radius=8,
         )
-        self._log_box.grid(row=12, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self._log_box.grid(row=14, column=0, sticky="nsew", padx=10, pady=(0, 10))
         self._log_box.configure(state="disabled")
 
     # ── Widget helpers ────────────────────────────────────────────────────────
@@ -1178,6 +1293,15 @@ class App(ctk.CTk):
         self._log_box.insert("end", f"[{ts}]  {msg}\n")
         self._log_box.see("end")
         self._log_box.configure(state="disabled")
+
+    def _append_agent(self, msg: str, phase: str = "") -> None:
+        ts = datetime.utcnow().strftime("%H:%M:%S")
+        self._agent_box.configure(state="normal")
+        self._agent_box.insert("end", f"[{ts}]  {msg}\n")
+        self._agent_box.see("end")
+        self._agent_box.configure(state="disabled")
+        if phase:
+            self._lbl_agent_phase.configure(text=phase)
 
     def _set_status(self, key: str) -> None:
         color, text = self._STATUS_MAP.get(key, ("#6e7681", f"● {key.upper()}"))
@@ -1388,6 +1512,11 @@ class App(ctk.CTk):
 
         if kind == "log":
             self._append_log(msg[1])
+
+        elif kind == "agent":
+            # msg = ("agent", text) or ("agent", text, phase_label)
+            phase = msg[2] if len(msg) > 2 else ""
+            self._append_agent(msg[1], phase)
 
         elif kind == "status":
             self._set_status(msg[1])
