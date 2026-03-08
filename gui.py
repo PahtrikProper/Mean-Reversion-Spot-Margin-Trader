@@ -365,7 +365,7 @@ class _BotController:
                     # closure to capture loop vars — throttled to 1 emit per
                     # 5-percentage-point bucket so the queue isn't flooded.
                     # 4000 trials → ≤21 callbacks per pair → ≤63 total for 3 pairs.
-                    def _make_cb(pidx: int, n_pairs: int) -> Any:
+                    def _make_cb(pidx: int, n_pairs: int, _sym: str, _iv: str) -> Any:
                         _last = [-1]
                         def cb(done: int, total: int) -> None:
                             bucket = (done * 20) // total  # 0–20 (one per 5%)
@@ -376,7 +376,7 @@ class _BotController:
                             base = (pidx - 1) / n_pairs
                             frac = (done / total) / n_pairs
                             self._emit("progress", base + frac,
-                                       f"Analyzing market conditions… {pct}%")
+                                       f"Analysing {_sym} {_iv}m… {pct}%")
                         return cb
 
                     opt = bot.optimise_bayesian(
@@ -391,7 +391,7 @@ class _BotController:
                         maker_fee_rate=maker_fee_for(sym),
                         interval_minutes=int(iv),
                         saved_best=_saved,
-                        progress_callback=_make_cb(pair_idx, n_pairs),
+                        progress_callback=_make_cb(pair_idx, n_pairs, sym, iv),
                         verbose=False,
                     )
 
@@ -589,7 +589,7 @@ class _PaperBotController:
                                        f"  ↳ Warm-starting from previous agent params  "
                                        f"MA={_saved['ma_len']}  BM={_saved['band_mult']:.4f}%")
 
-                        def _make_cb(pidx: int, npairs: int) -> Any:
+                        def _make_cb(pidx: int, npairs: int, _sym: str, _iv: str) -> Any:
                             _last = [-1]
                             def cb(done: int, total: int) -> None:
                                 bucket = (done * 20) // total  # 0–20 (one per 5%)
@@ -600,7 +600,7 @@ class _PaperBotController:
                                 base = (pidx - 1) / npairs
                                 frac = (done / total) / npairs
                                 self._emit("progress", base + frac,
-                                           f"Analyzing market conditions… {pct}%")
+                                           f"Analysing {_sym} {_iv}m… {pct}%")
                             return cb
 
                         opt = bot.optimise_bayesian(
@@ -615,7 +615,7 @@ class _PaperBotController:
                             maker_fee_rate=maker_fee_for(sym),
                             interval_minutes=int(iv),
                             saved_best=_saved,
-                            progress_callback=_make_cb(pair_idx, n_pairs),
+                            progress_callback=_make_cb(pair_idx, n_pairs, sym, iv),
                             verbose=False,
                         )
 
