@@ -754,13 +754,13 @@ class App(ctk.CTk):
 
     # ── UI Construction ───────────────────────────────────────────────────────
     def _build_ui(self) -> None:
-        self.grid_columnconfigure(0, weight=1)
-        # Row weights: trades table (10) and bottom tabview (11) expand
-        self.grid_rowconfigure(10, weight=1)
-        self.grid_rowconfigure(11, weight=2)
+        # ── Outer scrollable container ────────────────────────────────────────
+        self._scroll = ctk.CTkScrollableFrame(self, fg_color="#0d1117", corner_radius=0)
+        self._scroll.pack(fill="both", expand=True)
+        self._scroll.grid_columnconfigure(0, weight=1)
 
         # ── Header ────────────────────────────────────────────────────────────
-        hdr = ctk.CTkFrame(self, height=60, fg_color="#0d1117", corner_radius=0)
+        hdr = ctk.CTkFrame(self._scroll, height=60, fg_color="#0d1117", corner_radius=0)
         hdr.grid(row=0, column=0, sticky="ew")
         hdr.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(
@@ -775,7 +775,7 @@ class App(ctk.CTk):
         self._lbl_status.grid(row=0, column=2, padx=20, pady=16, sticky="e")
 
         # ── API Credentials (collapsible) ─────────────────────────────────────
-        api_outer = ctk.CTkFrame(self, fg_color="#161b22", corner_radius=8)
+        api_outer = ctk.CTkFrame(self._scroll, fg_color="#161b22", corner_radius=8)
         api_outer.grid(row=1, column=0, sticky="ew", padx=10, pady=(8, 0))
         api_outer.grid_columnconfigure(0, weight=1)
 
@@ -830,7 +830,7 @@ class App(ctk.CTk):
         self._lbl_key_status.pack(side="left", padx=14)
 
         # ── Settings (collapsible) ────────────────────────────────────────────
-        risk_outer = ctk.CTkFrame(self, fg_color="#161b22", corner_radius=8)
+        risk_outer = ctk.CTkFrame(self._scroll, fg_color="#161b22", corner_radius=8)
         risk_outer.grid(row=2, column=0, sticky="ew", padx=10, pady=(8, 0))
         risk_outer.grid_columnconfigure(0, weight=1)
 
@@ -1026,7 +1026,7 @@ class App(ctk.CTk):
 
 
         # ── Controls ──────────────────────────────────────────────────────────
-        ctrl = ctk.CTkFrame(self, fg_color="#161b22", corner_radius=8)
+        ctrl = ctk.CTkFrame(self._scroll, fg_color="#161b22", corner_radius=8)
         ctrl.grid(row=3, column=0, sticky="ew", padx=10, pady=8)
         ctrl.grid_columnconfigure(3, weight=1)
 
@@ -1064,7 +1064,7 @@ class App(ctk.CTk):
         self._lbl_ctrl_msg.grid(row=0, column=3, padx=14, sticky="w")
 
         # ── Progress bar (hidden until bot starts) ────────────────────────────
-        self._prog_outer = ctk.CTkFrame(self, fg_color="#161b22", corner_radius=8)
+        self._prog_outer = ctk.CTkFrame(self._scroll, fg_color="#161b22", corner_radius=8)
         self._prog_outer.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 8))
         self._prog_outer.grid_columnconfigure(0, weight=1)
         self._prog_outer.grid_remove()
@@ -1079,7 +1079,7 @@ class App(ctk.CTk):
         self._prog_lbl.grid(row=1, column=0, sticky="w", padx=14, pady=(0, 10))
 
         # ── Stat cards ────────────────────────────────────────────────────────
-        cards = ctk.CTkFrame(self, fg_color="transparent")
+        cards = ctk.CTkFrame(self._scroll, fg_color="transparent")
         cards.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 8))
         for i in range(5):
             cards.grid_columnconfigure(i, weight=1)
@@ -1091,7 +1091,7 @@ class App(ctk.CTk):
         self._card_lev    = self._stat_card(cards, "Leverage",         "--",    4)
 
         # ── Best strategy panel (hidden until first optimisation completes) ──────
-        self._best_outer = ctk.CTkFrame(self, fg_color="#161b22", corner_radius=8)
+        self._best_outer = ctk.CTkFrame(self._scroll, fg_color="#161b22", corner_radius=8)
         self._best_outer.grid(row=6, column=0, sticky="ew", padx=10, pady=(0, 8))
         self._best_outer.grid_columnconfigure(0, weight=1)
         self._best_outer.grid_remove()
@@ -1118,7 +1118,7 @@ class App(ctk.CTk):
         self._lbl_best_stats.grid(row=4, column=0, sticky="w", padx=14, pady=(1, 10))
 
         # ── Open position panel (hidden when flat) ────────────────────────────
-        self._pos_outer = ctk.CTkFrame(self, fg_color="#161b22", corner_radius=8)
+        self._pos_outer = ctk.CTkFrame(self._scroll, fg_color="#161b22", corner_radius=8)
         self._pos_outer.grid(row=7, column=0, sticky="ew", padx=10, pady=(0, 8))
         self._pos_outer.grid_columnconfigure(1, weight=1)
         self._pos_outer.grid_remove()
@@ -1136,7 +1136,7 @@ class App(ctk.CTk):
         self._lbl_pos_upnl.grid(row=2, column=0, sticky="w", padx=14, pady=(0, 10))
 
         # ── Last signal panel ──────────────────────────────────────────────────
-        sig_outer = ctk.CTkFrame(self, fg_color="#161b22", corner_radius=8)
+        sig_outer = ctk.CTkFrame(self._scroll, fg_color="#161b22", corner_radius=8)
         sig_outer.grid(row=8, column=0, sticky="ew", padx=10, pady=(0, 8))
         sig_outer.grid_columnconfigure(3, weight=1)
 
@@ -1162,7 +1162,7 @@ class App(ctk.CTk):
         self._lbl_sig_filled.grid(row=1, column=2, sticky="w", padx=(28, 0), pady=(0, 10))
 
         # ── Recent trades header ───────────────────────────────────────────────
-        trades_hdr = ctk.CTkFrame(self, fg_color="#161b22", corner_radius=0, height=32)
+        trades_hdr = ctk.CTkFrame(self._scroll, fg_color="#161b22", corner_radius=0, height=32)
         trades_hdr.grid(row=9, column=0, sticky="ew", padx=10, pady=(0, 0))
         ctk.CTkLabel(
             trades_hdr, text="RECENT TRADES",
@@ -1170,8 +1170,9 @@ class App(ctk.CTk):
         ).pack(anchor="w", padx=14, pady=(8, 4))
 
         # ── Trades table ──────────────────────────────────────────────────────
-        tree_frame = ctk.CTkFrame(self, fg_color="#161b22", corner_radius=8)
-        tree_frame.grid(row=10, column=0, sticky="nsew", padx=10, pady=(0, 8))
+        tree_frame = ctk.CTkFrame(self._scroll, fg_color="#161b22", corner_radius=8, height=175)
+        tree_frame.grid(row=10, column=0, sticky="ew", padx=10, pady=(0, 8))
+        tree_frame.grid_propagate(False)
         tree_frame.grid_columnconfigure(0, weight=1)
         tree_frame.grid_rowconfigure(0, weight=1)
 
@@ -1213,7 +1214,7 @@ class App(ctk.CTk):
         _mono = ctk.CTkFont(family="Courier New" if sys.platform == "win32" else "Courier", size=11)
 
         self._bottom_tabs = ctk.CTkTabview(
-            self,
+            self._scroll,
             fg_color="#0d1117",
             segmented_button_fg_color="#161b22",
             segmented_button_selected_color="#1f6feb",
@@ -1222,8 +1223,9 @@ class App(ctk.CTk):
             segmented_button_unselected_hover_color="#21262d",
             text_color="#c9d1d9",
             text_color_disabled="#6e7681",
+            height=280,
         )
-        self._bottom_tabs.grid(row=11, column=0, sticky="nsew", padx=10, pady=(4, 8))
+        self._bottom_tabs.grid(row=11, column=0, sticky="ew", padx=10, pady=(4, 8))
 
         # ── Agent tab ─────────────────────────────────────────────────────────
         self._bottom_tabs.add("🤖  Agent Analysis")
