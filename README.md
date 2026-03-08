@@ -4,7 +4,7 @@ An automated SHORT-only mean-reversion trading bot for Bybit USDT linear perpetu
 
 Symbols, leverage, intervals, and all strategy parameters are fully configurable — either through the GUI settings panel, a JSON config file, or `engine/utils/constants.py`.
 
-All trade data, optimisation runs, signals, events, and diagnostics are written to a single SQLite database (`paper_logs/trading.db`). No CSV or log files are used.
+All trade data, optimisation runs, signals, events, and diagnostics are written to a single SQLite database (`data/trading.db`). No CSV or log files are used.
 <img width="966" height="840" alt="Screenshot 2026-03-05 at 9 25 55 PM" src="https://github.com/user-attachments/assets/97fda080-b9a0-4ddc-af59-9377b9c57a8f" />
 
 ---
@@ -52,12 +52,18 @@ python build.py --cli    # CLI-only build
 ```
 Mean Reversion Trader/
 ├── main.py                  # CLI entry point
-├── gui.py                   # GUI entry point
+├── gui.py                   # GUI entry point (scrollable CustomTkinter)
 ├── build.py                 # PyInstaller build script
 ├── requirements.txt
 ├── requirements-build.txt
 ├── STRATEGY.md              # Full strategy specification
-└── engine/           # Core package
+├── scripts/
+│   └── run_analysis.py      # Standalone scheduled analysis (saves best params)
+├── .claude/
+│   └── agents/
+│       ├── market-analyst.md  # Claude agent: multi-interval optimisation
+│       └── trade-analyst.md   # Claude agent: DB/signal diagnostics
+└── engine/                  # Core package
     ├── core/
     │   ├── indicators.py        # All indicator maths
     │   └── orders.py            # Slippage simulation
@@ -81,7 +87,7 @@ Mean Reversion Trader/
     │   ├── position_gate.py     # Thread-safe slot gate (MAX_SLOTS=1)
     │   └── trading_status.py    # Real-time status monitor (periodic display)
     └── config/
-        └── default_config.json  # Default configuration
+        └── default_config.json  # Default configuration (patched by agent after analysis)
 ```
 
 ### 2. Create and activate a virtual environment (recommended)
@@ -134,7 +140,9 @@ Run the bot without setting environment variables. It will prompt you once (with
 python gui.py
 ```
 
-The GUI provides a full settings panel (expand **Settings** to configure):
+The GUI is fully **scrollable** — the entire window scrolls vertically so every panel is accessible regardless of screen size.
+
+#### Settings panel (click **Settings ▼** to expand)
 
 | Setting | Description |
 |---------|-------------|
@@ -147,7 +155,7 @@ The GUI provides a full settings panel (expand **Settings** to configure):
 
 Every setting has a dedicated **Apply** button. Changes take effect only when Apply is clicked; they are also locked in automatically when **START** is pressed.
 
-Once the bot starts, five **stat cards** are displayed at all times:
+#### Stat cards (always visible while running)
 
 | Card | Description |
 |------|-------------|
@@ -156,6 +164,15 @@ Once the bot starts, five **stat cards** are displayed at all times:
 | Win Rate | Win percentage across all closed trades |
 | Total Trades | Number of completed trades this session |
 | Leverage | Confirmed leverage in use — fetched from Bybit in live mode, set from Settings in paper mode |
+
+#### Bottom tab panel
+
+The bottom of the GUI has two tabs:
+
+| Tab | Description |
+|-----|-------------|
+| 🤖 Agent Analysis | Real-time feed of the Claude agent's work — per-interval optimisation results, warm-start notice, best params selection, and trading start confirmation. Switches to this tab automatically during analysis. |
+| Activity | Raw bot log — market data download, leverage check, re-opt events, stop/error messages. Switches to this tab automatically once trading begins. |
 
 Use the **LIVE / PAPER** toggle to switch modes, then press **START**.
 
@@ -279,13 +296,48 @@ See **`STRATEGY.md`** for the complete specification including exact formulas an
 
 ---
 
+## Claude Agent System
+
+The bot integrates two Claude agents (`.claude/agents/`). They require the Claude Code CLI to be installed locally — they are never called from the live trading loop.
+
+### market-analyst
+Invoked manually (or on a cron schedule) to run a full multi-interval optimisation, print a ranked report, and **save the best params** back to `data/best_params.json` and `engine/config/default_config.json`. The bot reads these params at the next startup and warm-starts its own optimiser from them (60% of trials exploit the proven region).
+
+```bash
+# One-shot analysis for the symbol in config
+python scripts/run_analysis.py
+
+# Override symbol, days, and trial count
+python scripts/run_analysis.py --symbol ETHUSDT --days 3 --trials 8000
+
+# Loop every 8 hours
+python scripts/run_analysis.py --loop --hours 8
+```
+
+Ask the Claude Code CLI directly:
+```
+claude "optimise for HYPE" --agent market-analyst
+claude "scan last 3 days for ETHUSDT" --agent market-analyst
+```
+
+### trade-analyst
+Queries `data/trading.db` to answer runtime questions about trades, signals, blocked entries, optimizer runs, and events.
+
+```
+claude "why aren't signals firing?" --agent trade-analyst
+claude "show me recent trades" --agent trade-analyst
+```
+
+---
+
 ## Logs and Output
 
 All data is written to a single SQLite database — no CSV or log files are created.
 
 | Path | Contents |
 |------|---------|
-| `paper_logs/trading.db` | SQLite database (WAL mode) containing all tables below |
+| `data/trading.db` | SQLite database (WAL mode) containing all tables below |
+| `data/best_params.json` | Latest best params saved by the market-analyst agent |
 
 ### Database Tables
 

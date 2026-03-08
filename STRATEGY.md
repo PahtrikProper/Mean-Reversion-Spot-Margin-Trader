@@ -1,6 +1,6 @@
 # Mean Reversion Strategy — Reference Document
 
-**Version**: 6.0
+**Version**: 6.1
 **Package**: `engine/`
 **Instrument**: Bybit USDT linear perpetuals (configurable)
 **Direction**: SHORT only — no long trades exist or should be added
@@ -248,7 +248,7 @@ Paper trading uses `PaperTrader` (`paper_trader.py`) instead of `LiveRealTrader`
 10. **`LIVE_TP_SCALE = 0.75`** — the server-side TP distance is always scaled to 75% of the backtested distance.
 11. **`SLIPPAGE_TICKS = 1`** — applies to paper/backtest fills only; live fills rely on Bybit execution.
 12. **Data-driven time TP** — after `TIME_TP_HOURS` (20 h) of holding, `compute_time_tp_pct()` queries the top-3 profitable 20h+ exits from the DB, averages their TP%, scales by `TIME_TP_SCALE` (0.75), and substitutes the result as the active TP. Falls back to `TIME_TP_FALLBACK_PCT` (0.5%) if fewer than 3 qualifying trades exist. Exit reason is `TIME_TP` (not `TP`) when this fires.
-13. **SQLite only — no CSV or log files.** All trade data, signals, orders, optimisation runs, events, and diagnostics are written exclusively to `paper_logs/trading.db`. `csv_append` and `ensure_csv` in `logger.py` are permanent no-ops.
+13. **SQLite only — no CSV or log files.** All trade data, signals, orders, optimisation runs, events, and diagnostics are written exclusively to `data/trading.db`. `csv_append` and `ensure_csv` in `logger.py` are permanent no-ops.
 14. **DB maintenance runs automatically.** `run_maintenance()` is called at startup (no VACUUM) and every 24 hours (full VACUUM) by a daemon thread in `main.py`. Each table has a defined retention period; stale rows are pruned before the WAL checkpoint and ANALYZE pass.
 
 ---
@@ -275,4 +275,7 @@ Paper trading uses `PaperTrader` (`paper_trader.py`) instead of `LiveRealTrader`
 | `engine/utils/position_gate.py` | Thread-safe slot gate (MAX_SLOTS=1) |
 | `engine/utils/trading_status.py` | `TradingStatusMonitor`: background daemon printing full status tables every 3 minutes |
 | `main.py` | CLI entry point: download → optimise → rank → live or paper trade |
-| `gui.py` | CustomTkinter GUI entry point |
+| `gui.py` | CustomTkinter GUI entry point (scrollable; includes Agent Analysis tab) |
+| `scripts/run_analysis.py` | Standalone scheduled analysis: multi-interval optimise, ranked report, saves best params to `data/best_params.json` and patches `default_config.json` |
+| `.claude/agents/market-analyst.md` | Claude agent: runs optimisation, signal scan, param warm-start, saves results |
+| `.claude/agents/trade-analyst.md` | Claude agent: queries `data/trading.db` for trades, signals, events, diagnostics |
