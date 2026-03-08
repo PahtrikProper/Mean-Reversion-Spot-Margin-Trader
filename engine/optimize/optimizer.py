@@ -185,7 +185,10 @@ def optimise_params(
     results_lock = threading.Lock()
     _done_count  = [0]                 # mutable counter for progress callback
     pbar         = tqdm(total=total, desc="Optimising", unit="trial", leave=False) if verbose else None
-    n_workers    = min(os.cpu_count() or 4, 6)
+    # Limit workers to 2 — more threads compete for the GIL during indicator
+    # computation, starving the Tkinter main thread and causing the macOS
+    # spinning beach-ball.  2 workers give a good speed/responsiveness trade-off.
+    n_workers    = min(os.cpu_count() or 2, 2)
 
     def _run_trial(combo):
         ma, bm_x10, tp_bp = combo

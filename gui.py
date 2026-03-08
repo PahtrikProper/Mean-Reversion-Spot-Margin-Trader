@@ -363,15 +363,16 @@ class _BotController:
                                    f"MA={_saved['ma_len']}  BM={_saved['band_mult']:.4f}%")
 
                     # closure to capture loop vars — throttled to 1 emit per
-                    # percentage point so the queue isn't flooded with thousands
-                    # of progress messages (4000 trials → ≤101 callbacks)
+                    # 5-percentage-point bucket so the queue isn't flooded.
+                    # 4000 trials → ≤21 callbacks per pair → ≤63 total for 3 pairs.
                     def _make_cb(pidx: int, n_pairs: int) -> Any:
                         _last = [-1]
                         def cb(done: int, total: int) -> None:
-                            pct = done * 100 // total
-                            if pct == _last[0] and done < total:
+                            bucket = (done * 20) // total  # 0–20 (one per 5%)
+                            if bucket == _last[0] and done < total:
                                 return
-                            _last[0] = pct
+                            _last[0] = bucket
+                            pct = min(100, bucket * 5)
                             base = (pidx - 1) / n_pairs
                             frac = (done / total) / n_pairs
                             self._emit("progress", base + frac,
@@ -590,10 +591,11 @@ class _PaperBotController:
                         def _make_cb(pidx: int, npairs: int) -> Any:
                             _last = [-1]
                             def cb(done: int, total: int) -> None:
-                                pct = done * 100 // total
-                                if pct == _last[0] and done < total:
+                                bucket = (done * 20) // total  # 0–20 (one per 5%)
+                                if bucket == _last[0] and done < total:
                                     return
-                                _last[0] = pct
+                                _last[0] = bucket
+                                pct = min(100, bucket * 5)
                                 base = (pidx - 1) / npairs
                                 frac = (done / total) / npairs
                                 self._emit("progress", base + frac,
@@ -1331,36 +1333,56 @@ class App(ctk.CTk):
             self._risk_toggle_btn.configure(text="  Settings  ▲")
         self._risk_open = not self._risk_open
 
-    def _append_log(self, msg: str) -> None:
+    def _batch_log(self, lines: list) -> None:
+        """Write one or more log lines using a SINGLE configure(state) pair.
+
+        On macOS each configure(state=) call on a CTkTextbox fires accessibility
+        notifications that can take 10-50 ms each.  Batching all lines in one
+        normal→disabled toggle reduces 2×N calls to 2, eliminating the source
+        of the spinning beach-ball during optimization.
+        """
+        if not lines:
+            return
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         self._log_box.configure(state="normal")
-        self._log_box.insert("end", f"[{ts}]  {msg}\n")
-        self._log_lines += 1
-        if self._log_lines > 400:          # trim: keep last 300 lines
-            self._log_box.delete("1.0", "101.0")
-            self._log_lines -= 100
+        for line in lines:
+            self._log_box.insert("end", f"[{ts}]  {line}\n")
+            self._log_lines += 1
+        if self._log_lines > 400:          # trim: keep last ~300 lines
+            to_remove = self._log_lines - 300
+            self._log_box.delete("1.0", f"{to_remove + 1}.0")
+            self._log_lines = 300
         self._log_box.see("end")
         self._log_box.configure(state="disabled")
 
-    def _append_agent(self, msg: str, phase: str = "") -> None:
+    def _batch_agent(self, msgs: list) -> None:
+        """Write one or more agent messages using a SINGLE configure(state) pair."""
+        if not msgs:
+            return
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         self._agent_box.configure(state="normal")
-        self._agent_box.insert("end", f"[{ts}]  {msg}\n")
-        self._agent_lines += 1
-        if self._agent_lines > 400:        # trim: keep last 300 lines
-            self._agent_box.delete("1.0", "101.0")
-            self._agent_lines -= 100
+        last_phase = ""
+        for msg in msgs:
+            self._agent_box.insert("end", f"[{ts}]  {msg[1]}\n")
+            self._agent_lines += 1
+            if len(msg) > 2 and msg[2]:
+                last_phase = msg[2]
+        if self._agent_lines > 400:        # trim: keep last ~300 lines
+            to_remove = self._agent_lines - 300
+            self._agent_box.delete("1.0", f"{to_remove + 1}.0")
+            self._agent_lines = 300
         self._agent_box.see("end")
         self._agent_box.configure(state="disabled")
-        if phase:
-            self._lbl_agent_phase.configure(text=phase)
-        # Auto-switch: show Agent tab during analysis, Activity once trading starts
-        if msg.startswith("🟢") or msg.startswith("🟡"):
+        if last_phase:
+            self._lbl_agent_phase.configure(text=last_phase)
+        # Auto-switch tabs based on the last message in the batch
+        last_text = msgs[-1][1] if msgs else ""
+        if last_text.startswith("🟢") or last_text.startswith("🟡"):
             try:
                 self._bottom_tabs.set("Activity")
             except Exception:
                 pass
-        elif not phase.startswith("Trading") and not phase.startswith("Paper"):
+        elif last_phase and not last_phase.startswith("Trading") and not last_phase.startswith("Paper"):
             try:
                 self._bottom_tabs.set("🤖  Agent Analysis")
             except Exception:
@@ -1540,13 +1562,43 @@ class App(ctk.CTk):
 
     # ── Queue polling ─────────────────────────────────────────────────────────
     def _poll(self) -> None:
-        # Process at most 30 messages per cycle so the event loop stays
-        # responsive during high-throughput phases (e.g. optimiser).
+        """Drain up to 30 queue messages per cycle.
+
+        Consecutive "log" and "agent" messages are batched together so the
+        expensive CTkTextbox state-toggle (configure normal→disabled) fires at
+        most twice per *group* instead of twice per *message*.  Message ordering
+        is preserved; only adjacent same-type messages are coalesced.
+        """
         try:
-            for _ in range(30):
-                self._handle(self._q.get_nowait())
-        except queue.Empty:
-            pass
+            # Collect up to 30 messages first (fast, no widget work)
+            msgs: list = []
+            try:
+                for _ in range(30):
+                    msgs.append(self._q.get_nowait())
+            except queue.Empty:
+                pass
+            except Exception:
+                pass
+
+            # Process in arrival order, batching same-type consecutive groups
+            i = 0
+            while i < len(msgs):
+                kind = msgs[i][0]
+                if kind == "log":
+                    batch: list = []
+                    while i < len(msgs) and msgs[i][0] == "log":
+                        batch.append(msgs[i][1])
+                        i += 1
+                    self._batch_log(batch)
+                elif kind == "agent":
+                    batch = []
+                    while i < len(msgs) and msgs[i][0] == "agent":
+                        batch.append(msgs[i])
+                        i += 1
+                    self._batch_agent(batch)
+                else:
+                    self._handle(msgs[i])
+                    i += 1
         except Exception:
             pass
         finally:
@@ -1556,12 +1608,12 @@ class App(ctk.CTk):
         kind = msg[0]
 
         if kind == "log":
-            self._append_log(msg[1])
+            # Fallback: _poll batches these, but handle individually if needed
+            self._batch_log([msg[1]])
 
         elif kind == "agent":
-            # msg = ("agent", text) or ("agent", text, phase_label)
-            phase = msg[2] if len(msg) > 2 else ""
-            self._append_agent(msg[1], phase)
+            # Fallback: _poll batches these, but handle individually if needed
+            self._batch_agent([msg])
 
         elif kind == "status":
             self._set_status(msg[1])
@@ -1597,8 +1649,14 @@ class App(ctk.CTk):
             self._card_lev.configure(text=msg[1])
 
         elif kind == "error":
-            self._append_log(f"Error: {msg[1]}")
-            messagebox.showerror("Bot Error", msg[1])
+            # Log the error inline — messagebox.showerror() is a BLOCKING modal
+            # dialog that prevents the Tkinter event loop from running, causing
+            # macOS to show the spinning beach-ball.  Inline display is safe.
+            short = str(msg[1])
+            if len(short) > 120:
+                short = short[:117] + "…"
+            self._batch_log([f"❌ Error: {short}"])
+            self._lbl_ctrl_msg.configure(text=f"Error — see Activity log")
 
         elif kind == "done":
             self._running = False
@@ -1620,7 +1678,7 @@ class App(ctk.CTk):
             self._set_status("idle")
             self._lbl_ctrl_msg.configure(text="Ready to start")
             self._prog_outer.grid_remove()
-            self._append_log("Bot stopped.")
+            self._batch_log(["Bot stopped."])
             self._refresh_trades()
 
     # ── Best strategy display ─────────────────────────────────────────────────
