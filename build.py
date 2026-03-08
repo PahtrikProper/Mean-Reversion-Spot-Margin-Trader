@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Cross-platform build script — packages HYPE Trader into a single executable.
+Cross-platform build script — packages Mean Reversion Trader into a single executable.
 
 PyInstaller does NOT cross-compile: run this script on the target OS.
-  macOS   →  dist/hype_trader      (or dist/hype_trader_cli)
-  Linux   →  dist/hype_trader      (or dist/hype_trader_cli)
-  Windows →  dist/hype_trader.exe  (or dist/hype_trader_cli.exe)
+  macOS   →  dist/mean_reversion_trader      (or dist/mean_reversion_trader_cli)
+  Linux   →  dist/mean_reversion_trader      (or dist/mean_reversion_trader_cli)
+  Windows →  dist/mean_reversion_trader.exe  (or dist/mean_reversion_trader_cli.exe)
 
 Usage:
     python build.py          # build the GUI version  (gui.py)
@@ -82,7 +82,7 @@ def _build(gui: bool) -> None:
 
     sep      = os.pathsep   # ':' on Unix, ';' on Windows
     entry    = "gui.py"   if gui else "main.py"
-    exe_name = "hype_trader" if gui else "hype_trader_cli"
+    exe_name = "mean_reversion_trader" if gui else "mean_reversion_trader_cli"
     hidden   = _GUI_HIDDEN  if gui else _COMMON_HIDDEN
 
     hidden_flags = []
@@ -112,7 +112,7 @@ def _build(gui: bool) -> None:
 
     mode = "GUI" if gui else "CLI"
     print("=" * 62)
-    print(f"  HYPE Trader — building {mode} executable")
+    print(f"  Mean Reversion Trader — building {mode} executable")
     print(f"  Entry    : {entry}")
     print(f"  Platform : {sys.platform}")
     print(f"  Python   : {sys.version.split()[0]}")
@@ -142,7 +142,7 @@ def _build(gui: bool) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Build HYPE Trader executable")
+    parser = argparse.ArgumentParser(description="Build Mean Reversion Trader executable")
     parser.add_argument("--cli", action="store_true",
                         help="Build the headless CLI version instead of the GUI")
     args = parser.parse_args()

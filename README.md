@@ -150,7 +150,7 @@ The GUI is designed to fit a standard 13-inch screen (~1280×832 px) without scr
 | Testing Period | Days of candle history used for optimisation (2–90 days) |
 | Number of Tests | Optimiser trials per symbol/interval pair |
 | Intervals | Candle sizes to test (1m, 3m, 5m, 15m, 30m, 60m) |
-| Symbols | Comma-separated list of Bybit USDT perpetual symbols — applies to both LIVE and PAPER modes |
+| Symbols | Comma-separated list of Bybit USDT perpetual symbols for **LIVE** mode. Paper mode always runs all four configured symbols (XRPUSDT, ETHUSDT, ESPUSDT, BTCUSDT) independently |
 | Leverage | Leverage multiplier for paper trading (1x–100x); live mode reads the actual setting from Bybit |
 
 Every setting has a dedicated **Apply** button. Changes take effect only when Apply is clicked; they are also locked in automatically when **START** is pressed.
@@ -219,12 +219,13 @@ python main.py --paper --max-loss 3
 
 ### Paper trading startup sequence
 
-1. Download public candle history (no API keys needed)
-2. Run the parameter optimiser for each (symbol, interval) pair
-3. Rank all pairs by score; launch the top-ranked paper trader
-4. Connect to Bybit public WebSocket for live candle data
-5. Simulate fills, PnL, fees, slippage, and liquidation using the exact Bybit formula
-6. Virtual starting wallet: **$500 USDT**
+1. Download public candle history for all paper symbols (no API keys needed)
+2. Run the parameter optimiser for each (symbol, interval) pair across all symbols: XRPUSDT, ETHUSDT, ESPUSDT, BTCUSDT
+3. Rank all pairs by score; launch the top-ranked paper trader **for each symbol independently**
+4. All symbol traders run concurrently — each has its own position gate, so they never block one another
+5. Connect to Bybit public WebSocket for live candle data
+6. Simulate fills, PnL, fees, slippage, and liquidation using the exact Bybit formula
+7. Virtual starting wallet: **$500 USDT** per symbol
 
 ---
 
@@ -234,7 +235,7 @@ Default settings live in `engine/utils/constants.py`. You can override most of t
 
 ```json
 {
-  "symbol":          "HYPEUSDT",
+  "symbol":          "XRPUSDT",
   "leverage":        10.0,
   "starting_wallet": 100.0,
   "entry": {
@@ -258,13 +259,13 @@ Place the file anywhere and pass it with `--config`.
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `SYMBOLS` | `["XRPUSDT"]` | Active symbols — used by both LIVE and PAPER modes; overridden by the GUI Symbols field or `--symbols` CLI flag |
+| `SYMBOLS` | `["XRPUSDT"]` | Active symbols for **LIVE** mode; overridden by the GUI Symbols field or `--symbols` CLI flag. Paper mode uses `PAPER_SYMBOLS` instead |
 | `CANDLE_INTERVALS` | `["1","3","5"]` | Candle sizes (minutes) tested during optimisation |
 | `DEFAULT_LEVERAGE` | `10.0` | Leverage for paper trading (live mode reads the actual setting from Bybit) |
 | `STARTING_WALLET` | `100.0` | Simulated wallet used by the backtester and optimiser (not the paper trading wallet) |
 | `PAPER_STARTING_BALANCE` | `500.0` | Virtual wallet size for paper trading (USDT) |
 | `MAX_SYMBOL_FRACTION` | `0.45` | Max wallet fraction used as margin per trade |
-| `MAX_ACTIVE_SYMBOLS` | `1` | Maximum number of simultaneously active traders (one per symbol) |
+| `MAX_ACTIVE_SYMBOLS` | `1` | Maximum simultaneous traders in **LIVE** mode (one per symbol). Paper mode always launches all configured `PAPER_SYMBOLS` independently |
 | `DAYS_BACK_SEED` | `1` | Days of history downloaded for seed + re-optimisation |
 | `INIT_TRIALS` | `4000` | Optimiser trials at startup |
 | `REOPT_INTERVAL_SEC` | `28800` | Re-optimise every 8 hours when flat |
@@ -327,7 +328,7 @@ python scripts/run_analysis.py --loop --hours 8
 
 Ask the Claude Code CLI directly:
 ```
-claude "optimise for HYPE" --agent market-analyst
+claude "optimise for XRPUSDT" --agent market-analyst
 claude "scan last 3 days for ETHUSDT" --agent market-analyst
 ```
 
@@ -402,8 +403,8 @@ No live API calls are made during tests — all fixtures use synthetic OHLCV dat
 ```bash
 pip install -r requirements-build.txt
 
-python build.py        # produces dist/hype_trader      (GUI)
-python build.py --cli  # produces dist/hype_trader_cli  (CLI)
+python build.py        # produces dist/mean_reversion_trader      (GUI)
+python build.py --cli  # produces dist/mean_reversion_trader_cli  (CLI)
 ```
 
 The executable bundles all dependencies and runs without a Python installation.
