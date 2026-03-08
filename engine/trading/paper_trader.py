@@ -32,6 +32,8 @@ from ..utils.constants import (
     COLOR_ERROR,
     COLOR_RESET,
     COLOR_SUBMITTED,
+    SIGNAL_DROUGHT_HOURS,
+    MAX_LOSS_PCT,
 )
 from ..utils.data_structures import RealPosition, EntryParams, ExitParams, MC_MIN_TRADES, MC_SIMS
 from ..utils.position_gate import PositionGate
@@ -119,6 +121,12 @@ class PaperTrader:
         self.account_pnl_usdt = 0.0
         self.account_pnl_pct  = 0.0
         self.last_signal: Optional[dict] = None
+
+        # ── Reliability & guard attributes ────────────────────────────────────
+        self._last_signal_ts: float    = time.time()   # for drought detection
+        self._halted: bool             = False          # True when max-loss fired
+        self._halt_ts: Optional[float] = None           # timestamp when halt started
+        self._last_drought_log: float  = 0.0            # cooldown for drought events
 
         if len(df_mark_seed) == 0:
             raise RuntimeError("No mark seed data")
@@ -612,6 +620,21 @@ class PaperTrader:
           3. Trail Stop    — high >= min_low_since_entry + mult×ATR
           4. Band Exit     — low drops below discount band
         """
+        try:
+            self._on_closed_candle_inner(candle)
+        except Exception as _occ_err:
+            _ts_err = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
+            log.error(f"[PAPER][{self.symbol}] on_closed_candle unhandled exception: {_occ_err}",
+                      exc_info=True)
+            _db.log_event(
+                ts_utc=_ts_err, level="ERROR", event_type="CANDLE_CALLBACK_ERROR",
+                symbol=self.symbol,
+                message=f"paper on_closed_candle crashed: {_occ_err}",
+                detail={"error": str(_occ_err)},
+            )
+
+    def _on_closed_candle_inner(self, candle: Dict[str, Any]):
+        """Inner implementation — wrapped by on_closed_candle for safety."""
         ts     = pd.to_datetime(int(candle["start"]), unit="ms", utc=True)
         ts_utc = ts.strftime("%Y-%m-%d %H:%M:%S")
         get_status_monitor().on_candle_received(self.symbol)
@@ -663,10 +686,57 @@ class PaperTrader:
         rsi_val = float(row["rsi"]) if not pd.isna(row["rsi"]) else 100.0
         atr_val = float(row["atr"]) if "atr" in self.df.columns and not pd.isna(row["atr"]) else 0.0
 
+        # ── Max-loss halt: auto-expire after 4 h ─────────────────────────────
+        if self._halted:
+            if time.time() - (self._halt_ts or 0) >= 4 * 3600:
+                self._halted  = False
+                self._halt_ts = None
+                log.info(f"[PAPER][{self.symbol}] Max-loss halt expired — resuming entries")
+                _db.log_event(ts_utc=ts_utc, level="INFO", event_type="MAX_LOSS_HALT_EXPIRED",
+                    symbol=self.symbol, message="4-hour max-loss halt expired — entries re-enabled",
+                    detail={})
+
+        _max_loss_pct = MAX_LOSS_PCT
+        if _max_loss_pct is not None and not self._halted:
+            if self.account_pnl_pct <= -abs(_max_loss_pct):
+                self._halted  = True
+                self._halt_ts = time.time()
+                log.warning(
+                    f"[PAPER][{self.symbol}] MAX-LOSS HALT: "
+                    f"session PnL={self.account_pnl_pct:.2f}% <= -{abs(_max_loss_pct):.1f}% "
+                    f"— halting entries for 4 hours"
+                )
+                _db.log_event(ts_utc=ts_utc, level="WARNING", event_type="MAX_LOSS_HALT",
+                    symbol=self.symbol,
+                    message=(f"Max-loss halt: PnL={self.account_pnl_pct:.2f}% <= "
+                             f"-{abs(_max_loss_pct):.1f}%"),
+                    detail={"session_pnl_pct": self.account_pnl_pct,
+                            "max_loss_pct": _max_loss_pct})
+                if self.position is not None:
+                    self._execute_exit(c, "MAX_LOSS", ts_utc)
+
         _raw_short = compute_entry_signals_raw(
             current_row=row, prev_row=prev,
             current_high=h, current_low=l,
         )
+
+        # ── Signal drought tracking ───────────────────────────────────────────
+        if _raw_short > 0:
+            self._last_signal_ts = time.time()
+        elif SIGNAL_DROUGHT_HOURS and SIGNAL_DROUGHT_HOURS > 0:
+            _drought_sec = time.time() - self._last_signal_ts
+            if (_drought_sec >= SIGNAL_DROUGHT_HOURS * 3600
+                    and time.time() - self._last_drought_log >= SIGNAL_DROUGHT_HOURS * 3600):
+                self._last_drought_log = time.time()
+                _db.log_event(
+                    ts_utc=ts_utc, level="WARNING", event_type="SIGNAL_DROUGHT",
+                    symbol=self.symbol,
+                    message=(f"No raw entry signal for {_drought_sec/3600:.1f}h "
+                             f"(threshold {SIGNAL_DROUGHT_HOURS:.0f}h)"),
+                    detail={"drought_hours": round(_drought_sec / 3600, 2),
+                            "threshold_hours": SIGNAL_DROUGHT_HOURS},
+                )
+
         entry_sig = resolve_entry_signals(_raw_short, adx_val, rsi_val) > 0
         _final_short = resolve_entry_signals(_raw_short, adx_val, rsi_val)
         exit_sig  = compute_exit_signals_raw(
@@ -876,9 +946,9 @@ class PaperTrader:
                     trail_stop_exit = True
 
         if entry_sig:
-            self.last_signal = {"type": "ENTRY", "time": ts_utc, "placed": False, "filled": False, "price": None}
+            self.last_signal = {"type": "ENTRY", "time": ts_utc, "placed": False, "filled": False, "price": None, "band": _raw_short}
         elif exit_sig or trail_stop_exit:
-            self.last_signal = {"type": "EXIT",  "time": ts_utc, "placed": False, "filled": False, "price": None}
+            self.last_signal = {"type": "EXIT",  "time": ts_utc, "placed": False, "filled": False, "price": None, "band": _raw_short}
 
         # ── Priority 3: Trail stop exit ──
         if not acted and trail_stop_exit and self.position is not None:
@@ -891,7 +961,7 @@ class PaperTrader:
             acted = True
 
         # ── Entry ──
-        if not acted and entry_sig and self.position is None:
+        if not acted and entry_sig and self.position is None and not self._halted:
             if self.wallet >= MIN_WALLET_USDT:
                 self._execute_entry(c, ts_utc, ts)
                 if self.position is not None and self._min_low_since_entry is None:

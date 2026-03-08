@@ -509,13 +509,51 @@ def _start_maintenance_thread() -> None:
     print("  DB maintenance thread started  (24 h cycle, VACUUM nightly)")
 
 
+def _validate_config() -> None:
+    """Validate active constants before starting traders.  Exits with a clear
+    message on any invalid configuration rather than crashing mid-run."""
+    import re
+    errors = []
+
+    lev = const_module.DEFAULT_LEVERAGE
+    if not (0 < lev <= 100):
+        errors.append(f"  leverage {lev} out of range (must be 1–100)")
+
+    symbols = const_module.SYMBOLS
+    if not symbols:
+        errors.append("  SYMBOLS list is empty")
+    for s in symbols:
+        if not re.match(r"^\w{3,20}USDT$", s, re.IGNORECASE):
+            errors.append(f"  symbol '{s}' looks invalid (expected format: XRPUSDT)")
+
+    valid_ivs = {"1", "3", "5", "15", "30", "60"}
+    for iv in const_module.CANDLE_INTERVALS:
+        if str(iv) not in valid_ivs:
+            errors.append(f"  interval '{iv}' not in Bybit set {sorted(valid_ivs, key=int)}")
+
+    if const_module.DAYS_BACK_SEED <= 0:
+        errors.append(f"  DAYS_BACK_SEED {const_module.DAYS_BACK_SEED} must be > 0")
+
+    if const_module.INIT_TRIALS <= 0:
+        errors.append(f"  INIT_TRIALS {const_module.INIT_TRIALS} must be > 0")
+
+    if errors:
+        print("\n  ✗ Configuration errors — fix before starting:\n")
+        for e in errors:
+            print(e)
+        print()
+        raise SystemExit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Mean Reversion Trader — Automated Bybit Short-only Trading Bot"
     )
-    parser.add_argument("--config",  type=str,   default=None, help="Path to config JSON")
-    parser.add_argument("--symbols", type=str,   nargs="+",    help="Override symbols (e.g. XRPUSDT)")
-    parser.add_argument("--paper",   action="store_true",      help="Paper trading mode — no API keys required")
+    parser.add_argument("--config",   type=str,   default=None, help="Path to config JSON")
+    parser.add_argument("--symbols",  type=str,   nargs="+",    help="Override symbols (e.g. XRPUSDT)")
+    parser.add_argument("--paper",    action="store_true",      help="Paper trading mode — no API keys required")
+    parser.add_argument("--max-loss", type=float, default=None, metavar="PCT",
+                        help="Halt trading for 4 h if session PnL drops by this %% (e.g. 5 = 5%%). Disabled by default.")
     args = parser.parse_args()
 
     print("  Loading configuration...")
@@ -530,6 +568,12 @@ def main():
     if args.symbols:
         const_module.SYMBOLS = args.symbols
         print(f"    Symbols overridden: {args.symbols}")
+
+    if args.max_loss is not None:
+        const_module.MAX_LOSS_PCT = float(args.max_loss)
+        print(f"    Max-loss guard: {args.max_loss:.1f}%  (4-hour halt on breach)")
+
+    _validate_config()
 
     logging.basicConfig(
         level   = logging.INFO,

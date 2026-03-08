@@ -96,6 +96,17 @@ PRINT_EVERY_CANDLE      = True
 API_POLITE_SLEEP        = 0.1
 REST_MIN_INTERVAL_SEC   = 0.2
 
+# ── Signal drought detection ───────────────────────────────────────────────────
+# If no raw entry signal fires for this many hours, a WARNING event is logged
+# and printed.  Set to 0 to disable.
+SIGNAL_DROUGHT_HOURS    = 4.0
+
+# ── Max-loss guard ────────────────────────────────────────────────────────────
+# If session PnL drops below -(MAX_LOSS_PCT / 100 × starting wallet), the bot
+# exits any open position and halts new entries for the session.
+# Set via --max-loss CLI flag.  None = disabled.
+MAX_LOSS_PCT            = None   # type: ignore[assignment]  float | None
+
 # ── API credentials ───────────────────────────────────────────────────────────
 def _load_api_credentials():
     api_key    = os.getenv("BYBIT_API_KEY",    "").strip()

@@ -140,7 +140,7 @@ Run the bot without setting environment variables. It will prompt you once (with
 python gui.py
 ```
 
-The GUI is fully **scrollable** — the entire window scrolls vertically so every panel is accessible regardless of screen size.
+The GUI is designed to fit a standard 13-inch screen (~1280×832 px) without scrolling. The API Credentials and Settings panels are **collapsible** — click the toggle to expand or hide them, keeping the core trading view on screen at all times.
 
 #### Settings panel (click **Settings ▼** to expand)
 
@@ -167,12 +167,15 @@ Every setting has a dedicated **Apply** button. Changes take effect only when Ap
 
 #### Bottom tab panel
 
-The bottom of the GUI has two tabs:
+The bottom of the GUI has three tabs:
 
 | Tab | Description |
 |-----|-------------|
 | 🤖 Agent Analysis | Real-time feed of the Claude agent's work — per-interval optimisation results, warm-start notice, best params selection, and trading start confirmation. Switches to this tab automatically during analysis. |
 | Activity | Raw bot log — market data download, leverage check, re-opt events, stop/error messages. Switches to this tab automatically once trading begins. |
+| 📈 Equity | Wallet equity history loaded from `balance_snapshots` in the SQLite DB, with a mini ASCII sparkline and session P&L summary. Updates every 10 s while the bot is running. |
+
+The **Best Strategy** panel also shows a **"Next re-optimisation in Xh Ym"** countdown, and the **Last Signal** panel shows the **Band level** (1–8) that triggered the signal.
 
 Use the **LIVE / PAPER** toggle to switch modes, then press **START**.
 
@@ -196,6 +199,12 @@ python main.py --paper
 
 # Paper trading with specific symbols
 python main.py --paper --symbols XRPUSDT ETHUSDT
+
+# Halt trading for 4 hours if session P&L drops by 5%
+python main.py --max-loss 5
+
+# Combined: paper trading with a 3% max-loss guard
+python main.py --paper --max-loss 3
 ```
 
 ### Live trading startup sequence
@@ -267,6 +276,8 @@ Place the file anywhere and pass it with `--config`.
 | `MAKER_FEE_RATE` | `0.0002` | Bybit maker fee rate |
 | `SLIPPAGE_TICKS` | `1` | Slippage ticks applied to simulated fills (paper and backtest only) |
 | `RANDOM_SEED` | `None` | Optimiser RNG seed — `None` for non-deterministic runs; set to an integer for reproducible results |
+| `SIGNAL_DROUGHT_HOURS` | `4.0` | Hours without any raw band crossover before a WARNING event is logged and the status monitor alerts |
+| `MAX_LOSS_PCT` | `None` | Session P&L drawdown threshold for the 4-hour trading halt (set via `--max-loss N`; `None` = disabled) |
 
 ---
 
@@ -321,11 +332,18 @@ claude "scan last 3 days for ETHUSDT" --agent market-analyst
 ```
 
 ### trade-analyst
-Queries `data/trading.db` to answer runtime questions about trades, signals, blocked entries, optimizer runs, and events.
+Queries `data/trading.db` to answer runtime questions about trades, signals, blocked entries, optimizer runs, and events. Includes four diagnostic queries:
+
+- **Parameter drift**: compares MA/BandMult/TP across last 5 optimisation runs
+- **Losing trade patterns**: groups completed trades by exit reason to identify the costliest exit type
+- **Signal drought check**: shows the most recent signal row and flags if it's older than 4 hours
+- **Hourly performance**: groups trades by UTC hour to identify the best and worst trading periods
 
 ```
 claude "why aren't signals firing?" --agent trade-analyst
 claude "show me recent trades" --agent trade-analyst
+claude "analyse my losing trades" --agent trade-analyst
+claude "what hours perform best?" --agent trade-analyst
 ```
 
 ---
@@ -358,6 +376,24 @@ All data is written to a single SQLite database — no CSV or log files are crea
 | `mark_price_ticks` | 3 days | High-frequency mark-price ticks for liquidation monitoring |
 
 DB maintenance (pruning, WAL checkpoint, ANALYZE, VACUUM) runs automatically in a background thread at startup and every 24 hours.
+
+---
+
+## Unit Tests
+
+A `tests/` directory contains pytest-based unit tests for core engine components:
+
+```bash
+python -m pytest tests/ -v
+```
+
+| Test file | Coverage |
+|-----------|---------|
+| `tests/test_indicators.py` | RMA, EMA, crossover detection, `compute_entry_signals_raw`, `resolve_entry_signals` (ADX/RSI gates) |
+| `tests/test_orders.py` | `apply_slippage()` — SHORT sell and buy cover, zero-tick case |
+| `tests/test_backtester.py` | `backtest_once()` smoke test, flat-market no-liquidation, wallet history, PnL consistency |
+
+No live API calls are made during tests — all fixtures use synthetic OHLCV data.
 
 ---
 

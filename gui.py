@@ -51,7 +51,7 @@ from tkinter import messagebox, ttk
 # ── Bot imports ───────────────────────────────────────────────────────────────
 import engine as bot
 from engine.utils import constants as C
-from engine.utils.constants import LIVE_TP_SCALE
+from engine.utils.constants import LIVE_TP_SCALE, REOPT_INTERVAL_SEC
 from engine.utils.api_key_prompt import (
     CREDS_FILE,
     _load_credentials,
@@ -228,6 +228,14 @@ class _StatsPoller(threading.Thread):
                 signal_info = dict(t.last_signal)
                 break
 
+        # Re-opt countdown — seconds until the next scheduled re-optimisation
+        reopt_sec = 0.0
+        for t in self._traders.values():
+            lr = getattr(t, "last_reopt_time", None)
+            if lr is not None:
+                reopt_sec = max(0.0, REOPT_INTERVAL_SEC - (time.time() - lr))
+                break
+
         # All traders share the same Bybit Unified account, so balance and
         # account PnL come from a single trader — summing would double-count.
         # Only realized_pnl_net is per-trade and correctly summed across symbols.
@@ -247,6 +255,7 @@ class _StatsPoller(threading.Thread):
             "position":        pos_info,
             "symbols":         list(self._traders.keys()),
             "signal":          signal_info,
+            "next_reopt_sec":  reopt_sec,
         }))
 
 
@@ -1115,7 +1124,13 @@ class App(ctk.CTk):
 
         self._lbl_best_stats = ctk.CTkLabel(self._best_outer, text="",
                                              font=ctk.CTkFont(size=13))
-        self._lbl_best_stats.grid(row=4, column=0, sticky="w", padx=14, pady=(1, 10))
+        self._lbl_best_stats.grid(row=4, column=0, sticky="w", padx=14, pady=(1, 4))
+
+        self._lbl_reopt_countdown = ctk.CTkLabel(
+            self._best_outer, text="",
+            font=ctk.CTkFont(size=11), text_color="#8b949e",
+        )
+        self._lbl_reopt_countdown.grid(row=5, column=0, sticky="w", padx=14, pady=(0, 8))
 
         # ── Open position panel (hidden when flat) ────────────────────────────
         self._pos_outer = ctk.CTkFrame(self._scroll, fg_color="#161b22", corner_radius=8)
@@ -1138,12 +1153,12 @@ class App(ctk.CTk):
         # ── Last signal panel ──────────────────────────────────────────────────
         sig_outer = ctk.CTkFrame(self._scroll, fg_color="#161b22", corner_radius=8)
         sig_outer.grid(row=8, column=0, sticky="ew", padx=10, pady=(0, 8))
-        sig_outer.grid_columnconfigure(3, weight=1)
+        sig_outer.grid_columnconfigure(4, weight=1)
 
         ctk.CTkLabel(
             sig_outer, text="LAST SIGNAL",
             font=ctk.CTkFont(size=11, weight="bold"), text_color="#8b949e",
-        ).grid(row=0, column=0, columnspan=4, sticky="w", padx=14, pady=(8, 2))
+        ).grid(row=0, column=0, columnspan=5, sticky="w", padx=14, pady=(8, 2))
 
         self._lbl_sig_type = ctk.CTkLabel(
             sig_outer, text="—  No signals yet",
@@ -1160,6 +1175,11 @@ class App(ctk.CTk):
             sig_outer, text="", font=ctk.CTkFont(size=13),
         )
         self._lbl_sig_filled.grid(row=1, column=2, sticky="w", padx=(28, 0), pady=(0, 10))
+
+        self._lbl_sig_band = ctk.CTkLabel(
+            sig_outer, text="", font=ctk.CTkFont(size=13), text_color="#d29922",
+        )
+        self._lbl_sig_band.grid(row=1, column=3, sticky="w", padx=(28, 14), pady=(0, 10))
 
         # ── Recent trades header ───────────────────────────────────────────────
         trades_hdr = ctk.CTkFrame(self._scroll, fg_color="#161b22", corner_radius=0, height=32)
@@ -1262,6 +1282,21 @@ class App(ctk.CTk):
         )
         self._log_box.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
         self._log_box.configure(state="disabled")
+
+        # ── Equity tab ────────────────────────────────────────────────────────
+        self._bottom_tabs.add("📈  Equity")
+        _eq_tab = self._bottom_tabs.tab("📈  Equity")
+        _eq_tab.grid_columnconfigure(0, weight=1)
+        _eq_tab.grid_rowconfigure(0, weight=1)
+
+        self._equity_box = ctk.CTkTextbox(
+            _eq_tab,
+            font=_mono,
+            fg_color="#0d1117", text_color="#3fb950",
+            corner_radius=6,
+        )
+        self._equity_box.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+        self._equity_box.configure(state="disabled")
 
         # Start on Agent tab so analysis is immediately visible
         self._bottom_tabs.set("🤖  Agent Analysis")
@@ -1684,11 +1719,16 @@ class App(ctk.CTk):
             placed  = sig.get("placed", False)
             filled  = sig.get("filled", False)
             sprice  = sig.get("price")
+            sband   = sig.get("band", 0)
 
             type_color = "#3fb950" if stype == "ENTRY" else "#d29922"
             self._lbl_sig_type.configure(
                 text=f"{stype}  ·  {stime}", text_color=type_color,
             )
+            if sband:
+                self._lbl_sig_band.configure(text=f"Band {sband}")
+            else:
+                self._lbl_sig_band.configure(text="")
             if placed:
                 self._lbl_sig_placed.configure(
                     text="Order placed  ✓", text_color="#3fb950",
@@ -1707,55 +1747,122 @@ class App(ctk.CTk):
                 )
                 self._lbl_sig_filled.configure(text="")
 
+        # ── Re-opt countdown ──────────────────────────────────────────────────
+        reopt_sec = d.get("next_reopt_sec", 0.0)
+        if reopt_sec > 0:
+            rh = int(reopt_sec / 3600)
+            rm = int((reopt_sec % 3600) / 60)
+            self._lbl_reopt_countdown.configure(
+                text=f"Next re-optimisation in  {rh:02d}h {rm:02d}m"
+            )
+
     # ── Trades table ──────────────────────────────────────────────────────────
     def _refresh_trades(self) -> None:
         try:
             self._load_trades()
         except Exception:
             pass
+        try:
+            self._load_equity()
+        except Exception:
+            pass
         if self._running:
             self.after(10_000, self._refresh_trades)
 
     def _load_trades(self) -> None:
-        path = C.TRADES_CSV_PATH
-        if not os.path.exists(path):
+        import sqlite3
+        db_path = C.DB_PATH
+        if not os.path.exists(db_path):
             return
-
-        rows = []
         try:
-            with open(path, "r", encoding="utf-8", newline="") as f:
-                for row in csv.DictReader(f):
-                    # Only show completed (closed) trades
-                    action = row.get("action", "").upper()
-                    if action != "EXIT":
-                        continue
-                    pnl    = float(row.get("pnl_net", 0) or 0)
-                    reason = row.get("reason", "").upper()
-                    sign   = "+" if pnl >= 0 else ""
-                    rows.append({
-                        "time":   row.get("ts_utc", "")[:16],
-                        "symbol": row.get("symbol", "XRPUSDT"),
-                        "entry":  f"${float(row.get('entry_price', 0) or 0):.5f}",
-                        "exit":   f"${float(row.get('fill_price',  0) or 0):.5f}",
-                        "pnl":    f"{sign}${pnl:.4f}",
-                        "result": reason.replace("ADX_", "").replace("_EXIT", "").title(),
-                        "tag":    "win" if pnl >= 0 else "loss",
-                    })
+            conn = sqlite3.connect(db_path, timeout=5)
+            cur  = conn.cursor()
+            cur.execute("""
+                SELECT ts_utc, symbol, entry_price, exit_price, pnl_net, reason
+                FROM trades
+                ORDER BY ts_utc DESC
+                LIMIT 20
+            """)
+            rows_db = cur.fetchall()
+            conn.close()
         except Exception:
             return
 
         for item in self._tree.get_children():
             self._tree.delete(item)
 
-        for row in reversed(rows[-20:]):
+        for ts, sym, entry, exit_, pnl, reason in rows_db:
+            pnl    = float(pnl or 0)
+            sign   = "+" if pnl >= 0 else ""
+            tag    = "win" if pnl >= 0 else "loss"
+            r      = (reason or "").upper().replace("ADX_", "").replace("_EXIT", "").title()
             self._tree.insert("", "end",
-                              values=(row["time"], row["symbol"],
-                                      row["entry"], row["exit"],
-                                      row["pnl"],   row["result"]),
-                              tags=(row["tag"],))
+                              values=(str(ts)[:16], sym or "",
+                                      f"${float(entry or 0):.5f}",
+                                      f"${float(exit_ or 0):.5f}",
+                                      f"{sign}${pnl:.4f}",
+                                      r),
+                              tags=(tag,))
 
         self._tree.tag_configure("win",  foreground="#3fb950")
         self._tree.tag_configure("loss", foreground="#f85149")
+
+    def _load_equity(self) -> None:
+        """Populate the Equity tab with balance snapshots from SQLite."""
+        import sqlite3
+        db_path = C.DB_PATH
+        if not os.path.exists(db_path):
+            return
+        try:
+            conn = sqlite3.connect(db_path, timeout=5)
+            cur  = conn.cursor()
+            cur.execute("""
+                SELECT ts_utc, symbol, event, balance
+                FROM balance_snapshots
+                ORDER BY ts_utc DESC
+                LIMIT 40
+            """)
+            rows_db = cur.fetchall()
+            conn.close()
+        except Exception:
+            return
+
+        if not rows_db:
+            return
+
+        # Build a compact ASCII equity display (newest → oldest, top → bottom)
+        rows_db = list(reversed(rows_db))   # chronological order
+        balances = [float(r[3] or 0) for r in rows_db]
+        start_bal = balances[0] if balances else 0.0
+        peak_bal  = max(balances)
+        curr_bal  = balances[-1]
+        total_pnl = curr_bal - start_bal
+
+        # Mini sparkline using block chars
+        if len(balances) > 1:
+            lo, hi = min(balances), max(balances)
+            span   = (hi - lo) or 1.0
+            blocks = " ▁▂▃▄▅▆▇█"
+            spark  = "".join(blocks[max(0, min(8, int((b - lo) / span * 8)))] for b in balances[-32:])
+        else:
+            spark = "—"
+
+        sign = "+" if total_pnl >= 0 else ""
+        lines = [
+            f"  Session P&L  {sign}${total_pnl:.4f}   Peak ${peak_bal:.4f}   Now ${curr_bal:.4f}",
+            f"  {spark}",
+            f"  {'─' * 60}",
+            f"  {'Time (UTC)':<19}  {'Symbol':<10}  {'Event':<18}  {'Balance':>10}",
+            f"  {'─' * 60}",
+        ]
+        for ts, sym, evt, bal in rows_db[-30:]:
+            lines.append(f"  {str(ts)[:16]:<19}  {(sym or ''):<10}  {(evt or ''):<18}  ${float(bal or 0):>9.4f}")
+
+        text = "\n".join(lines)
+        self._equity_box.configure(state="normal")
+        self._equity_box.delete("1.0", "end")
+        self._equity_box.insert("end", text)
+        self._equity_box.configure(state="disabled")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

@@ -6,7 +6,7 @@ import time
 import logging
 from typing import Dict, Any, Optional
 from datetime import datetime
-from .constants import LIVE_TP_SCALE, REOPT_INTERVAL_SEC
+from .constants import LIVE_TP_SCALE, REOPT_INTERVAL_SEC, SIGNAL_DROUGHT_HOURS, MAX_LOSS_PCT
 
 log = logging.getLogger("trading_status")
 
@@ -56,10 +56,53 @@ class TradingStatusMonitor:
                     self.last_balance_update = now
                 else:
                     self._display_quick_status()
+                self._check_alerts()
                 time.sleep(10)
             except Exception as e:
                 log.error(f"Status monitor error: {e}")
                 time.sleep(10)
+
+    def _check_alerts(self):
+        """Print WARNING banners when signal drought or max-loss threshold detected."""
+        import time as _t
+        with self.lock:
+            traders = dict(self.traders_ref)
+        if not traders:
+            return
+
+        # ── Signal drought alert ─────────────────────────────────────────────
+        if SIGNAL_DROUGHT_HOURS and SIGNAL_DROUGHT_HOURS > 0:
+            drought_threshold = SIGNAL_DROUGHT_HOURS * 3600.0
+            for symbol, trader in traders.items():
+                last_ts = getattr(trader, "_last_signal_ts", None)
+                if last_ts is None:
+                    continue
+                elapsed = _t.time() - last_ts
+                if elapsed >= drought_threshold:
+                    hrs = elapsed / 3600.0
+                    # Only print every full-status interval to avoid spam
+                    msg = (
+                        f"\n⚠  SIGNAL DROUGHT  {symbol}  —  "
+                        f"no raw entry signal for {hrs:.1f}h  "
+                        f"(threshold {SIGNAL_DROUGHT_HOURS:.0f}h)\n"
+                    )
+                    sys.stdout.write(msg)
+                    sys.stdout.flush()
+
+        # ── Max-loss alert ────────────────────────────────────────────────────
+        if MAX_LOSS_PCT is not None:
+            for symbol, trader in traders.items():
+                halted = getattr(trader, "_halted", False)
+                if halted:
+                    halt_ts = getattr(trader, "_halt_ts", None)
+                    if halt_ts is not None:
+                        remaining = max(0.0, 4 * 3600.0 - (_t.time() - halt_ts))
+                        msg = (
+                            f"\n🛑  MAX-LOSS HALT  {symbol}  —  "
+                            f"resumes in {remaining/3600:.1f}h\n"
+                        )
+                        sys.stdout.write(msg)
+                        sys.stdout.flush()
 
     def _display_full_status(self):
         with self.lock:

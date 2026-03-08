@@ -1,6 +1,6 @@
 # Mean Reversion Strategy — Reference Document
 
-**Version**: 6.1
+**Version**: 6.2
 **Package**: `engine/`
 **Instrument**: Bybit USDT linear perpetuals (configurable)
 **Direction**: SHORT only — no long trades exist or should be added
@@ -140,6 +140,8 @@ compute_exit_signals_raw(current_row, prev_row, current_low, current_high) -> in
 | `TRAIL_ATR_PERIOD` | 14 | `constants.py` |
 | `TRAIL_ATR_MULT` | 3.0 | `constants.py` |
 | `LIVE_TP_SCALE` | 0.75 | `constants.py` |
+| `SIGNAL_DROUGHT_HOURS` | 4.0 | `constants.py` |
+| `MAX_LOSS_PCT` | None | `constants.py` (set via `--max-loss` CLI flag) |
 | `TIME_TP_HOURS` | 20.0 | `constants.py` |
 | `TIME_TP_FALLBACK_PCT` | 0.005 | `constants.py` |
 | `TIME_TP_SCALE` | 0.75 | `constants.py` |
@@ -180,6 +182,9 @@ If the score is ≤ 0 the old params are kept.
 ### Note on `optimise_bayesian`
 `optimise_bayesian` exported from `optimizer.py` is an **alias** for `optimise_params`. It is the same random-search engine with exploitation/exploration split — not a Bayesian (TPE) implementation.
 
+### Parallel Trial Execution
+The optimiser runs trials in parallel using `ThreadPoolExecutor` (up to `min(cpu_count, 6)` workers). DataFrames are shared as read-only references (no pickling). NumPy operations release the GIL, giving a modest speedup (≈1.5–2×) on multi-core machines.
+
 ---
 
 ## Live Trading Architecture
@@ -209,7 +214,21 @@ No signals are generated until this many candles have been received.
 `PositionGate` (`MAX_SLOTS = 1`): only one symbol may hold an open position at a time.
 
 ### Status Monitor
-`TradingStatusMonitor` (`trading_status.py`) runs in a background daemon thread and prints a full status table every 3 minutes showing: total balance, session P&L, per-symbol trade stats (trades / wins / losses / win rate), open position details (entry, TP, mark price, uPnL), and next re-opt countdown. It never blocks candle processing.
+`TradingStatusMonitor` (`trading_status.py`) runs in a background daemon thread and prints a full status table every 3 minutes showing: total balance, session P&L, per-symbol trade stats (trades / wins / losses / win rate), open position details (entry, TP, mark price, uPnL), and next re-opt countdown. It never blocks candle processing. Additionally it checks every 10 s for: signal drought (no raw band crossover for `SIGNAL_DROUGHT_HOURS` → prints WARNING banner), and max-loss halt state (session PnL below `MAX_LOSS_PCT` → prints HALT banner with remaining time).
+
+### Reliability Guards
+| Guard | Implementation |
+|-------|---------------|
+| `_refresh_state()` error handling | REST failures keep cached wallet/position and log `REFRESH_STATE_FAILED` event; exits still run |
+| `on_closed_candle()` outer wrapper | Entire callback body wrapped in try/except — logs `CANDLE_CALLBACK_ERROR` and returns cleanly so the WebSocket thread never crashes |
+| WebSocket exponential backoff | Reconnection delay = `min(5 × 2^attempt, 60)` seconds; resets to 5 s on clean connect |
+| Gate release guarantee | `_execute_exit()` releases the `PositionGate` in a `finally` block unconditionally |
+
+### Signal Drought Detection
+After every closed candle, if no raw band crossover (`_raw_short > 0`) has been seen for `SIGNAL_DROUGHT_HOURS` (4.0 h), a `SIGNAL_DROUGHT` WARNING event is logged to the DB and the status monitor prints a WARNING banner. A cooldown prevents duplicate events within the same drought window.
+
+### Max-Loss Halt (`--max-loss`)
+When `MAX_LOSS_PCT` is set (via `--max-loss N` CLI flag), the bot monitors session P&L on every candle. If session PnL drops below `-MAX_LOSS_PCT%`: any open position is exited immediately, a `MAX_LOSS_HALT` event is logged, and new entries are blocked for **4 hours**. The halt auto-expires — normal trading resumes after the 4-hour window.
 
 ### Liquidation Formula (SHORT, isolated margin, USDT linear)
 ```
@@ -250,6 +269,9 @@ Paper trading uses `PaperTrader` (`paper_trader.py`) instead of `LiveRealTrader`
 12. **Data-driven time TP** — after `TIME_TP_HOURS` (20 h) of holding, `compute_time_tp_pct()` queries the top-3 profitable 20h+ exits from the DB, averages their TP%, scales by `TIME_TP_SCALE` (0.75), and substitutes the result as the active TP. Falls back to `TIME_TP_FALLBACK_PCT` (0.5%) if fewer than 3 qualifying trades exist. Exit reason is `TIME_TP` (not `TP`) when this fires.
 13. **SQLite only — no CSV or log files.** All trade data, signals, orders, optimisation runs, events, and diagnostics are written exclusively to `data/trading.db`. `csv_append` and `ensure_csv` in `logger.py` are permanent no-ops.
 14. **DB maintenance runs automatically.** `run_maintenance()` is called at startup (no VACUUM) and every 24 hours (full VACUUM) by a daemon thread in `main.py`. Each table has a defined retention period; stale rows are pruned before the WAL checkpoint and ANALYZE pass.
+15. **`_maybe_reoptimise` must never block the WebSocket thread — and must not start if `_refresh_state()` just failed.** If `_refresh_failed` is set, skip the re-opt trigger for that candle.
+16. **Max-loss halts are temporary (4 hours), not permanent.** After `4 × 3600` seconds the `_halted` flag auto-clears and entries resume normally.
+17. **Config validation at startup.** `_validate_config()` in `main.py` checks leverage (1–100), symbols format (`\w+USDT`), intervals (subset of {1,3,5,15,30,60}), `days_back > 0`, `trials > 0`. Invalid config raises `SystemExit` with a clear message.
 
 ---
 
@@ -274,8 +296,11 @@ Paper trading uses `PaperTrader` (`paper_trader.py`) instead of `LiveRealTrader`
 | `engine/utils/plotting.py` | ASCII equity-curve chart (`plot_pnl_chart`) and Monte Carlo terminal report (`print_monte_carlo_report`) |
 | `engine/utils/position_gate.py` | Thread-safe slot gate (MAX_SLOTS=1) |
 | `engine/utils/trading_status.py` | `TradingStatusMonitor`: background daemon printing full status tables every 3 minutes |
-| `main.py` | CLI entry point: download → optimise → rank → live or paper trade |
-| `gui.py` | CustomTkinter GUI entry point (scrollable; includes Agent Analysis tab) |
+| `main.py` | CLI entry point: download → optimise → rank → live or paper trade; `--max-loss` flag; `_validate_config()` |
+| `gui.py` | CustomTkinter GUI: Agent Analysis, Activity, and 📈 Equity tabs; re-opt countdown; band level display; SQLite trade loading |
+| `tests/test_indicators.py` | Unit tests for RMA, EMA, crossover, entry/exit signal functions |
+| `tests/test_orders.py` | Unit tests for slippage application |
+| `tests/test_backtester.py` | Smoke and regression tests for `backtest_once()` |
 | `scripts/run_analysis.py` | Standalone scheduled analysis: multi-interval optimise, ranked report, saves best params to `data/best_params.json` and patches `default_config.json` |
 | `.claude/agents/market-analyst.md` | Claude agent: runs optimisation, signal scan, param warm-start, saves results |
 | `.claude/agents/trade-analyst.md` | Claude agent: queries `data/trading.db` for trades, signals, events, diagnostics |

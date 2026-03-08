@@ -40,6 +40,8 @@ from ..utils.constants import (
     TIME_TP_HOURS,
     TIME_TP_FALLBACK_PCT,
     TIME_TP_SCALE,
+    SIGNAL_DROUGHT_HOURS,
+    MAX_LOSS_PCT,
 )
 from ..utils import constants as _C
 from ..utils.data_structures import RealPosition, PendingSignal, EntryParams, ExitParams, MC_MIN_TRADES, MC_SIMS
@@ -122,6 +124,11 @@ class LiveRealTrader:
         self.account_pnl_usdt      = 0.0
         self.account_pnl_pct       = 0.0
         self.last_signal: Optional[dict] = None
+        # ── Reliability & guard attributes ────────────────────────────────────
+        self._last_signal_ts: float      = time.time()   # for drought detection
+        self._halted: bool               = False          # True when max-loss fired
+        self._halt_ts: Optional[float]   = None           # when halt started
+        self._refresh_failed: bool       = False          # True when last REST refresh failed
         self._last_entry_fee: float = 0.0  # entry fee stored for accurate exit PnL
         self._min_low_since_entry: Optional[float] = None  # Jason McIntosh trail stop
         self._reopt_running: bool = False  # guard against concurrent reopt threads
@@ -209,13 +216,27 @@ class LiveRealTrader:
             )
 
     def _refresh_state(self):
-        self.wallet         = float(self.client.get_unified_usdt())
-        self.position       = self.client.get_position(self.symbol)
-        self.account_pnl_usdt = self.wallet - float(self.initial_wallet)
-        self.account_pnl_pct  = (
-            (self.account_pnl_usdt / float(self.initial_wallet)) * 100.0
-            if self.initial_wallet else 0.0
-        )
+        """Query wallet + position from Bybit REST.  On failure, keep cached
+        values and log a warning so the candle callback can still run exits."""
+        try:
+            self.wallet   = float(self.client.get_unified_usdt())
+            self.position = self.client.get_position(self.symbol)
+            self.account_pnl_usdt = self.wallet - float(self.initial_wallet)
+            self.account_pnl_pct  = (
+                (self.account_pnl_usdt / float(self.initial_wallet)) * 100.0
+                if self.initial_wallet else 0.0
+            )
+            self._refresh_failed = False
+        except Exception as _re:
+            self._refresh_failed = True
+            _ts = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
+            log.warning(f"[{self.symbol}] _refresh_state failed (cached state kept): {_re}")
+            _db.log_event(
+                ts_utc=_ts, level="WARNING", event_type="REFRESH_STATE_FAILED",
+                symbol=self.symbol,
+                message=f"REST refresh failed — using cached wallet/position: {_re}",
+                detail={"error": str(_re)},
+            )
 
     # ── Mark price callback ────────────────────────────────────────────────────
 
@@ -381,8 +402,6 @@ class LiveRealTrader:
                     detail={"order_id": order_id, "reason": reason,
                             "qty_to_close": qty_to_close, "close_price": close_price,
                             "entry_price": pos.entry_price})
-                if self.position is None:
-                    self.gate.release(self.symbol)
                 return
 
             fill_price = summary["avg_price"]
@@ -422,9 +441,9 @@ class LiveRealTrader:
                 self._refresh_state()
             except Exception:
                 pass
-
-        if self.position is None:
-            self.gate.release(self.symbol)
+        finally:
+            if self.position is None:
+                self.gate.release(self.symbol)
 
     # ── External close handler ─────────────────────────────────────────────────
 
@@ -744,230 +763,297 @@ class LiveRealTrader:
           9. Check entry signal (band crossover AND ADX gate AND RSI gate)
          10. Log candle-close summary
         """
-        ts      = pd.to_datetime(int(candle["start"]), unit="ms", utc=True)
-        ts_utc  = ts.strftime("%Y-%m-%d %H:%M:%S")
-        get_status_monitor().on_candle_received(self.symbol)
+        try:
+            ts      = pd.to_datetime(int(candle["start"]), unit="ms", utc=True)
+            ts_utc  = ts.strftime("%Y-%m-%d %H:%M:%S")
+            get_status_monitor().on_candle_received(self.symbol)
 
-        ts_ms = int(candle["start"])
-        o   = float(candle["open"])
-        h   = float(candle["high"])
-        l   = float(candle["low"])
-        c   = float(candle["close"])
-        vol = float(candle.get("volume", 0))
+            ts_ms = int(candle["start"])
+            o   = float(candle["open"])
+            h   = float(candle["high"])
+            l   = float(candle["low"])
+            c   = float(candle["close"])
+            vol = float(candle.get("volume", 0))
 
-        new_row = pd.DataFrame([{"ts": ts, "open": o, "high": h, "low": l, "close": c, "volume": vol}])
-        self.df = pd.concat([self.df, new_row], ignore_index=True)
-        if len(self.df) > KEEP_CANDLES:
-            self.df = self.df.iloc[-KEEP_CANDLES:].reset_index(drop=True)
+            new_row = pd.DataFrame([{"ts": ts, "open": o, "high": h, "low": l, "close": c, "volume": vol}])
+            self.df = pd.concat([self.df, new_row], ignore_index=True)
+            if len(self.df) > KEEP_CANDLES:
+                self.df = self.df.iloc[-KEEP_CANDLES:].reset_index(drop=True)
 
-        self._recompute_indicators()
-        self.closed_candle_count += 1
-        self._maybe_reoptimise()
-        self._refresh_state()
+            self._recompute_indicators()
+            self.closed_candle_count += 1
+            self._maybe_reoptimise()
+            self._refresh_state()
 
-        # ── DB: raw candle ──
-        _db.log_candle(
-            ts_utc=ts_utc, ts_ms=ts_ms, symbol=self.symbol,
-            interval=self.interval, price_type="last",
-            o=o, h=h, l=l, c=c, vol=vol,
-        )
+            # ── Max-loss guard (4-hour halt) ──────────────────────────────────────
+            if self._halted:
+                if time.time() - (self._halt_ts or 0) >= 4 * 3600:
+                    self._halted  = False
+                    self._halt_ts = None
+                    _ts_hl = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
+                    log.info(f"[{self.symbol}] Max-loss halt expired — resuming entries")
+                    _db.log_event(ts_utc=_ts_hl, level="INFO", event_type="MAX_LOSS_HALT_EXPIRED",
+                        symbol=self.symbol, message="4-hour max-loss halt expired — entries re-enabled",
+                        detail={})
 
-        # acted: set True after any exit or external-close this candle so we never
-        # place an entry on the same candle we just closed a position.
-        acted = False
-
-        # ── Detect externally-closed position (server TP, liquidation, or manual close) ──
-        # _entry_price is set whenever we are tracking an open position (whether entered
-        # this session or detected at startup).  If position is now gone but we were
-        # tracking one, the close happened outside _execute_exit — handle it properly.
-        if self.position is None and self._entry_price is not None:
-            self._handle_external_close(ts_utc, c)
-            acted = True
-
-        # ── Warm-up guard ──
-        min_len = self.entry_params.ma_len + 20
-        if len(self.df) < min_len or "adx" not in self.df.columns:
-            log.info(
-                f"[{ts_utc}] {self.symbol} Candle #{self.closed_candle_count} "
-                f"(warm-up {len(self.df)}/{min_len})  "
-                f"O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f}"
-            )
-            return
-
-        row  = self.df.iloc[-1]
-        prev = self.df.iloc[-2]
-
-        adx_val = float(row["adx"])
-        rsi_val = float(row["rsi"]) if not pd.isna(row["rsi"]) else 100.0
-        atr_val = float(row["atr"]) if "atr" in self.df.columns and not pd.isna(row["atr"]) else 0.0
-
-        _raw_short = compute_entry_signals_raw(
-            current_row=row, prev_row=prev,
-            current_high=h, current_low=l,
-        )
-        _final_short = resolve_entry_signals(_raw_short, adx_val, rsi_val)
-        entry_sig = _final_short > 0
-        _raw_exit = compute_exit_signals_raw(
-            current_row=row, prev_row=prev,
-            current_low=l, current_high=h,
-        )
-        exit_sig = _raw_exit > 0
-
-        # ── DB: candle analytics ──
-        _db.log_candle_analytics(
-            ts_utc=ts_utc, symbol=self.symbol, interval=self.interval,
-            df=self.df, mark_price=self.mark_price,
-            ma_len=self.entry_params.ma_len, band_mult=self.entry_params.band_mult,
-        )
-
-        # ── DB: signal ──
-        _trail_stop_lvl = None
-        if self.position is not None and self._min_low_since_entry is not None and atr_val > 0:
-            _trail_stop_lvl = self._min_low_since_entry + float(self.exit_params.trail_atr_mult) * atr_val
-
-        if entry_sig:
-            _sig_type = "ENTRY"
-            _blocked  = None
-        elif _raw_exit > 0:
-            _sig_type = "EXIT_BAND"
-            _blocked  = None
-        elif _trail_stop_lvl is not None and h >= _trail_stop_lvl:
-            _sig_type = "EXIT_TRAIL"
-            _blocked  = None
-        else:
-            _sig_type = "NONE"
-            _blocked  = None
-            if _raw_short > 0 and _final_short == 0:
-                _blocked = "ADX" if adx_val >= 25 else "RSI"
-
-        _db.log_signal(
-            ts_utc=ts_utc, symbol=self.symbol, interval=self.interval,
-            signal_type=_sig_type,
-            raw_band_level=_raw_short, final_band_level=_final_short,
-            adx=adx_val, rsi=rsi_val, atr=atr_val if atr_val else None,
-            trail_stop_level=_trail_stop_lvl,
-            blocked_by=_blocked,
-            o=o, h=h, l=l, c=c,
-            ma_len=self.entry_params.ma_len,
-            band_mult=self.entry_params.band_mult,
-            tp_pct=self.exit_params.tp_pct,
-        )
-
-        # ── DB: position snapshot ──
-        if self.position is not None:
-            _qty_abs  = abs(self.position.qty)
-            _upnl     = (self.position.entry_price - self.mark_price) * _qty_abs
-            _ts_entry = self._entry_time.strftime("%Y-%m-%d %H:%M:%S") if self._entry_time else None
-            _tp_snap  = self._entry_price * (1.0 - float(self.exit_params.tp_pct) * _C.LIVE_TP_SCALE) if self._entry_price else None
-            _db.log_position(
-                ts_utc=ts_utc, symbol=self.symbol,
-                qty=-_qty_abs,
-                entry_price=self.position.entry_price,
-                entry_time=_ts_entry,
-                mark_price=self.mark_price,
-                liquidation_price=self.position.liq_price,
-                unrealized_pnl=_upnl,
-                min_low_since_entry=self._min_low_since_entry,
-                trail_stop_price=_trail_stop_lvl,
-                tp_price=_tp_snap,
-                wallet=self.wallet,
-            )
-        else:
-            _db.log_position(
-                ts_utc=ts_utc, symbol=self.symbol,
-                qty=None, entry_price=None, entry_time=None,
-                mark_price=self.mark_price,
-                liquidation_price=None, unrealized_pnl=None,
-                min_low_since_entry=None, trail_stop_price=None,
-                tp_price=None, wallet=self.wallet,
-            )
-
-        # ── Update Jason McIntosh trail stop tracking ──
-        if self.position is not None and self._min_low_since_entry is not None:
-            self._min_low_since_entry = min(self._min_low_since_entry, l)
-
-        # ── Time-based TP tightening (20h after entry → data-driven tighter TP) ──
-        if (self.position is not None
-                and self._entry_time is not None
-                and not self._time_tp_applied):
-            try:
-                elapsed_sec = (
-                    pd.Timestamp.now(tz="UTC").tz_convert(None)
-                    - self._entry_time.tz_convert(None)
-                ).total_seconds()
-                if elapsed_sec >= TIME_TP_HOURS * 3600:
-                    _dyn_tp_pct = _db.compute_time_tp_pct(
-                        symbol=self.symbol,
-                        min_hold_hours=TIME_TP_HOURS,
-                        fallback_pct=TIME_TP_FALLBACK_PCT,
-                        scale=TIME_TP_SCALE,
+            _max_loss_pct = MAX_LOSS_PCT
+            if _max_loss_pct is not None and not self._halted:
+                _session_pnl_pct = self.account_pnl_pct   # already computed each candle
+                if _session_pnl_pct <= -abs(_max_loss_pct):
+                    self._halted  = True
+                    self._halt_ts = time.time()
+                    _ts_hl = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
+                    log.warning(
+                        f"[{self.symbol}] MAX-LOSS HALT: session PnL={_session_pnl_pct:.2f}% "
+                        f"<= -{abs(_max_loss_pct):.1f}%  — halting entries for 4 hours"
                     )
-                    new_tp = self._format_price(
-                        self.position.entry_price * (1.0 - _dyn_tp_pct)
-                    )
-                    self.client.set_trading_stop(self.symbol, new_tp)
-                    self._time_tp_applied = True
-                    log.info(
-                        f"{COLOR_EXIT}[{ts_utc}] {TIME_TP_HOURS:.0f}h elapsed — "
-                        f"server TP tightened to {new_tp:.8f} ({_dyn_tp_pct*100:.3f}% from entry){COLOR_RESET}"
-                    )
-                    _db.log_event(
-                        ts_utc=ts_utc, level="INFO", event_type="TIME_TP_APPLIED",
+                    _db.log_event(ts_utc=_ts_hl, level="WARNING", event_type="MAX_LOSS_HALT",
                         symbol=self.symbol,
                         message=(
-                            f"{TIME_TP_HOURS:.0f}h time TP fired — server target "
-                            f"{new_tp:.8f} ({_dyn_tp_pct*100:.3f}%)"
+                            f"Max-loss halt triggered: session PnL={_session_pnl_pct:.2f}% "
+                            f"<= -{abs(_max_loss_pct):.1f}%"
                         ),
-                        detail={"entry_price": self.position.entry_price, "new_tp": new_tp,
-                                "elapsed_hours": round(elapsed_sec / 3600, 2),
-                                "time_tp_pct": _dyn_tp_pct,
-                                "is_fallback": _dyn_tp_pct == TIME_TP_FALLBACK_PCT},
+                        detail={"session_pnl_pct": _session_pnl_pct,
+                                "max_loss_pct": _max_loss_pct})
+                    # Exit any open position immediately
+                    if self.position is not None:
+                        _ts_ex = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
+                        log.warning(f"[{self.symbol}] Max-loss: closing open position now")
+                        self._execute_exit(close_price=self.position.mark_price or self.mark_price,
+                                           reason="MAX_LOSS", ts_utc=_ts_ex)
+
+            # ── DB: raw candle ──
+            _db.log_candle(
+                ts_utc=ts_utc, ts_ms=ts_ms, symbol=self.symbol,
+                interval=self.interval, price_type="last",
+                o=o, h=h, l=l, c=c, vol=vol,
+            )
+
+            # acted: set True after any exit or external-close this candle so we never
+            # place an entry on the same candle we just closed a position.
+            acted = False
+
+            # ── Detect externally-closed position (server TP, liquidation, or manual close) ──
+            # _entry_price is set whenever we are tracking an open position (whether entered
+            # this session or detected at startup).  If position is now gone but we were
+            # tracking one, the close happened outside _execute_exit — handle it properly.
+            if self.position is None and self._entry_price is not None:
+                self._handle_external_close(ts_utc, c)
+                acted = True
+
+            # ── Warm-up guard ──
+            min_len = self.entry_params.ma_len + 20
+            if len(self.df) < min_len or "adx" not in self.df.columns:
+                log.info(
+                    f"[{ts_utc}] {self.symbol} Candle #{self.closed_candle_count} "
+                    f"(warm-up {len(self.df)}/{min_len})  "
+                    f"O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f}"
+                )
+                return
+
+            row  = self.df.iloc[-1]
+            prev = self.df.iloc[-2]
+
+            adx_val = float(row["adx"])
+            rsi_val = float(row["rsi"]) if not pd.isna(row["rsi"]) else 100.0
+            atr_val = float(row["atr"]) if "atr" in self.df.columns and not pd.isna(row["atr"]) else 0.0
+
+            _raw_short = compute_entry_signals_raw(
+                current_row=row, prev_row=prev,
+                current_high=h, current_low=l,
+            )
+            # ── Signal drought tracking ──────────────────────────────────────────
+            if _raw_short > 0:
+                self._last_signal_ts = time.time()
+
+            _final_short = resolve_entry_signals(_raw_short, adx_val, rsi_val)
+            entry_sig = _final_short > 0
+            _raw_exit = compute_exit_signals_raw(
+                current_row=row, prev_row=prev,
+                current_low=l, current_high=h,
+            )
+            exit_sig = _raw_exit > 0
+
+            # ── Drought event (log once per SIGNAL_DROUGHT_HOURS window) ─────────
+            if SIGNAL_DROUGHT_HOURS and SIGNAL_DROUGHT_HOURS > 0:
+                _drought_sec = time.time() - self._last_signal_ts
+                if _drought_sec >= SIGNAL_DROUGHT_HOURS * 3600:
+                    _ts_d = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
+                    _db.log_event(
+                        ts_utc=_ts_d, level="WARNING", event_type="SIGNAL_DROUGHT",
+                        symbol=self.symbol,
+                        message=(
+                            f"No raw entry signal for {_drought_sec/3600:.1f}h "
+                            f"(threshold {SIGNAL_DROUGHT_HOURS:.0f}h)"
+                        ),
+                        detail={"drought_hours": round(_drought_sec / 3600, 2),
+                                "threshold_hours": SIGNAL_DROUGHT_HOURS},
                     )
-            except Exception as _ttp_err:
-                log.warning(f"[{ts_utc}] Time-based TP update failed: {_ttp_err}")
 
-        # ── Jason McIntosh trail stop signal ──
-        trail_stop_exit = False
-        if self.position is not None and self._min_low_since_entry is not None:
-            trail_atr_val = float(row["atr"]) if "atr" in self.df.columns and not pd.isna(row["atr"]) else 0.0
-            if trail_atr_val > 0:
-                trail_stop_lvl = self._min_low_since_entry + float(self.exit_params.trail_atr_mult) * trail_atr_val
-                if h >= trail_stop_lvl:
-                    trail_stop_exit = True
+            # ── DB: candle analytics ──
+            _db.log_candle_analytics(
+                ts_utc=ts_utc, symbol=self.symbol, interval=self.interval,
+                df=self.df, mark_price=self.mark_price,
+                ma_len=self.entry_params.ma_len, band_mult=self.entry_params.band_mult,
+            )
 
-        if entry_sig:
-            self.last_signal = {"type": "ENTRY", "time": ts_utc, "placed": False, "filled": False, "price": None}
-        elif exit_sig or trail_stop_exit:
-            self.last_signal = {"type": "EXIT",  "time": ts_utc, "placed": False, "filled": False, "price": None}
+            # ── DB: signal ──
+            _trail_stop_lvl = None
+            if self.position is not None and self._min_low_since_entry is not None and atr_val > 0:
+                _trail_stop_lvl = self._min_low_since_entry + float(self.exit_params.trail_atr_mult) * atr_val
 
-        # ── Jason McIntosh trail stop exit ──  (priority 3, matches backtester)
-        if not acted and trail_stop_exit and self.position is not None:
-            self._execute_exit(c, "TRAIL_STOP", ts_utc)
-            acted = True
-
-        # ── Band exit ──  (priority 4, only if no other action this candle)
-        if not acted and exit_sig and self.position is not None:
-            self._execute_exit(c, "BAND_EXIT", ts_utc)
-            acted = True
-
-        # ── Entry logic ──  (never on the same candle as an exit or external close)
-        if not acted and entry_sig and self.position is None:
-            if self.wallet >= MIN_WALLET_USDT:
-                self._execute_entry(c, ts_utc, ts)
-                # Initialise trail stop tracking with this bar's low if entry filled
-                if self.position is not None and self._min_low_since_entry is None:
-                    self._min_low_since_entry = l
+            if entry_sig:
+                _sig_type = "ENTRY"
+                _blocked  = None
+            elif _raw_exit > 0:
+                _sig_type = "EXIT_BAND"
+                _blocked  = None
+            elif _trail_stop_lvl is not None and h >= _trail_stop_lvl:
+                _sig_type = "EXIT_TRAIL"
+                _blocked  = None
             else:
-                log.warning(f"[{ts_utc}] Entry signal — wallet {self.wallet:.4f} < {MIN_WALLET_USDT}")
-        elif entry_sig and self.position is not None:
-            log.info(f"[{ts_utc}] Entry signal — already SHORT (no pyramiding)")
+                _sig_type = "NONE"
+                _blocked  = None
+                if _raw_short > 0 and _final_short == 0:
+                    _blocked = "ADX" if adx_val >= 25 else "RSI"
 
-        # ── Display ──
-        self._display_candle_close(
-            ts_utc=ts_utc, o=o, h=h, l=l, c=c,
-            entry_sig=entry_sig, exit_sig=exit_sig,
-            adx=adx_val, rsi=rsi_val,
-        )
+            _db.log_signal(
+                ts_utc=ts_utc, symbol=self.symbol, interval=self.interval,
+                signal_type=_sig_type,
+                raw_band_level=_raw_short, final_band_level=_final_short,
+                adx=adx_val, rsi=rsi_val, atr=atr_val if atr_val else None,
+                trail_stop_level=_trail_stop_lvl,
+                blocked_by=_blocked,
+                o=o, h=h, l=l, c=c,
+                ma_len=self.entry_params.ma_len,
+                band_mult=self.entry_params.band_mult,
+                tp_pct=self.exit_params.tp_pct,
+            )
+
+            # ── DB: position snapshot ──
+            if self.position is not None:
+                _qty_abs  = abs(self.position.qty)
+                _upnl     = (self.position.entry_price - self.mark_price) * _qty_abs
+                _ts_entry = self._entry_time.strftime("%Y-%m-%d %H:%M:%S") if self._entry_time else None
+                _tp_snap  = self._entry_price * (1.0 - float(self.exit_params.tp_pct) * _C.LIVE_TP_SCALE) if self._entry_price else None
+                _db.log_position(
+                    ts_utc=ts_utc, symbol=self.symbol,
+                    qty=-_qty_abs,
+                    entry_price=self.position.entry_price,
+                    entry_time=_ts_entry,
+                    mark_price=self.mark_price,
+                    liquidation_price=self.position.liq_price,
+                    unrealized_pnl=_upnl,
+                    min_low_since_entry=self._min_low_since_entry,
+                    trail_stop_price=_trail_stop_lvl,
+                    tp_price=_tp_snap,
+                    wallet=self.wallet,
+                )
+            else:
+                _db.log_position(
+                    ts_utc=ts_utc, symbol=self.symbol,
+                    qty=None, entry_price=None, entry_time=None,
+                    mark_price=self.mark_price,
+                    liquidation_price=None, unrealized_pnl=None,
+                    min_low_since_entry=None, trail_stop_price=None,
+                    tp_price=None, wallet=self.wallet,
+                )
+
+            # ── Update Jason McIntosh trail stop tracking ──
+            if self.position is not None and self._min_low_since_entry is not None:
+                self._min_low_since_entry = min(self._min_low_since_entry, l)
+
+            # ── Time-based TP tightening (20h after entry → data-driven tighter TP) ──
+            if (self.position is not None
+                    and self._entry_time is not None
+                    and not self._time_tp_applied):
+                try:
+                    elapsed_sec = (
+                        pd.Timestamp.now(tz="UTC").tz_convert(None)
+                        - self._entry_time.tz_convert(None)
+                    ).total_seconds()
+                    if elapsed_sec >= TIME_TP_HOURS * 3600:
+                        _dyn_tp_pct = _db.compute_time_tp_pct(
+                            symbol=self.symbol,
+                            min_hold_hours=TIME_TP_HOURS,
+                            fallback_pct=TIME_TP_FALLBACK_PCT,
+                            scale=TIME_TP_SCALE,
+                        )
+                        new_tp = self._format_price(
+                            self.position.entry_price * (1.0 - _dyn_tp_pct)
+                        )
+                        self.client.set_trading_stop(self.symbol, new_tp)
+                        self._time_tp_applied = True
+                        log.info(
+                            f"{COLOR_EXIT}[{ts_utc}] {TIME_TP_HOURS:.0f}h elapsed — "
+                            f"server TP tightened to {new_tp:.8f} ({_dyn_tp_pct*100:.3f}% from entry){COLOR_RESET}"
+                        )
+                        _db.log_event(
+                            ts_utc=ts_utc, level="INFO", event_type="TIME_TP_APPLIED",
+                            symbol=self.symbol,
+                            message=(
+                                f"{TIME_TP_HOURS:.0f}h time TP fired — server target "
+                                f"{new_tp:.8f} ({_dyn_tp_pct*100:.3f}%)"
+                            ),
+                            detail={"entry_price": self.position.entry_price, "new_tp": new_tp,
+                                    "elapsed_hours": round(elapsed_sec / 3600, 2),
+                                    "time_tp_pct": _dyn_tp_pct,
+                                    "is_fallback": _dyn_tp_pct == TIME_TP_FALLBACK_PCT},
+                        )
+                except Exception as _ttp_err:
+                    log.warning(f"[{ts_utc}] Time-based TP update failed: {_ttp_err}")
+
+            # ── Jason McIntosh trail stop signal ──
+            trail_stop_exit = False
+            if self.position is not None and self._min_low_since_entry is not None:
+                trail_atr_val = float(row["atr"]) if "atr" in self.df.columns and not pd.isna(row["atr"]) else 0.0
+                if trail_atr_val > 0:
+                    trail_stop_lvl = self._min_low_since_entry + float(self.exit_params.trail_atr_mult) * trail_atr_val
+                    if h >= trail_stop_lvl:
+                        trail_stop_exit = True
+
+            if entry_sig:
+                self.last_signal = {"type": "ENTRY", "time": ts_utc, "placed": False, "filled": False, "price": None, "band": _raw_short}
+            elif exit_sig or trail_stop_exit:
+                self.last_signal = {"type": "EXIT",  "time": ts_utc, "placed": False, "filled": False, "price": None, "band": _raw_short}
+
+            # ── Jason McIntosh trail stop exit ──  (priority 3, matches backtester)
+            if not acted and trail_stop_exit and self.position is not None:
+                self._execute_exit(c, "TRAIL_STOP", ts_utc)
+                acted = True
+
+            # ── Band exit ──  (priority 4, only if no other action this candle)
+            if not acted and exit_sig and self.position is not None:
+                self._execute_exit(c, "BAND_EXIT", ts_utc)
+                acted = True
+
+            # ── Entry logic ──  (never on the same candle as an exit or external close)
+            if not acted and entry_sig and self.position is None and not self._halted:
+                if self.wallet >= MIN_WALLET_USDT:
+                    self._execute_entry(c, ts_utc, ts)
+                    # Initialise trail stop tracking with this bar's low if entry filled
+                    if self.position is not None and self._min_low_since_entry is None:
+                        self._min_low_since_entry = l
+                else:
+                    log.warning(f"[{ts_utc}] Entry signal — wallet {self.wallet:.4f} < {MIN_WALLET_USDT}")
+            elif entry_sig and self.position is not None:
+                log.info(f"[{ts_utc}] Entry signal — already SHORT (no pyramiding)")
+
+            # ── Display ──
+            self._display_candle_close(
+                ts_utc=ts_utc, o=o, h=h, l=l, c=c,
+                entry_sig=entry_sig, exit_sig=exit_sig,
+                adx=adx_val, rsi=rsi_val,
+            )
+        except Exception as _occ_err:
+            _ts_err = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
+            log.error(f"[{self.symbol}] on_closed_candle unhandled exception: {_occ_err}", exc_info=True)
+            _db.log_event(
+                ts_utc=_ts_err, level="ERROR", event_type="CANDLE_CALLBACK_ERROR",
+                symbol=self.symbol,
+                message=f"on_closed_candle crashed: {_occ_err}",
+                detail={"error": str(_occ_err)},
+            )
 
 
 # ─── WebSocket loop ────────────────────────────────────────────────────────────
@@ -1089,18 +1175,22 @@ def start_live_ws(traders: Dict[str, Any], stop_event: threading.Event = None):
     threading.Thread(target=_ping_thread,  daemon=True, name="ws-ping").start()
     threading.Thread(target=_stop_watcher, daemon=True, name="ws-stop").start()
 
+    _ws_attempt = 0
     try:
         while True:
             if stop_event and stop_event.is_set():
                 break
             try:
-                run_one()
+                run_one()  # WebSocketApp.run_forever() — blocks until close
+                _ws_attempt = 0  # reset backoff on clean exit
             except Exception as e:
                 log.error(f"WS crashed: {e}")
             if stop_event and stop_event.is_set():
                 break
-            log.warning("WebSocket disconnected. Reconnecting in 5s...")
-            time.sleep(5)
+            _backoff = min(5 * (2 ** _ws_attempt), 60)
+            _ws_attempt += 1
+            log.warning(f"WebSocket disconnected. Reconnecting in {_backoff}s (attempt {_ws_attempt})...")
+            time.sleep(_backoff)
     finally:
         _ping_stop["stop"] = True
         status_monitor.stop()

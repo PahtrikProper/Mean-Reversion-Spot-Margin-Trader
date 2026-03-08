@@ -25,7 +25,10 @@ import sys
 import math
 import time
 import uuid
+import os
+import threading
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, Optional
 from tqdm import tqdm
 
@@ -178,11 +181,14 @@ def optimise_params(
     if verbose:
         print(f"  Time TP: {_time_tp_pct*100:.3f}% after {TIME_TP_HOURS:.0f}h hold\n")
 
-    results = []
-    milestone = max(1, total // 10)
-    pbar = tqdm(total=total, desc="Optimising", unit="trial", leave=False) if verbose else None
+    results      = []
+    results_lock = threading.Lock()
+    _done_count  = [0]                 # mutable counter for progress callback
+    pbar         = tqdm(total=total, desc="Optimising", unit="trial", leave=False) if verbose else None
+    n_workers    = min(os.cpu_count() or 4, 6)
 
-    for idx, (ma, bm_x10, tp_bp) in enumerate(combos, 1):
+    def _run_trial(combo):
+        ma, bm_x10, tp_bp = combo
         band_mult = bm_x10 / 10.0
         tp = tp_bp * 0.0001
         ep = EntryParams(ma_len=ma, band_mult=band_mult)
@@ -192,47 +198,61 @@ def optimise_params(
             time_tp_pct=_time_tp_pct,
             interval_minutes_bt=interval_minutes,
         )
-        if pbar:
-            pbar.update(1)
-        if progress_callback:
+        return ma, bm_x10, tp_bp, band_mult, tp, res
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(_run_trial, combo): combo for combo in combos}
+        for future in as_completed(futures):
             try:
-                progress_callback(idx, total)
-            except Exception:
-                pass
+                ma, bm_x10, tp_bp, band_mult, tp, res = future.result()
+            except Exception as _exc:
+                log.debug(f"[OPT] Trial raised: {_exc}")
+                res = None
 
-        if res is None or res.liquidated or res.trades < OPT_MIN_TRADES:
-            continue
+            with results_lock:
+                _done_count[0] += 1
+                idx = _done_count[0]
 
-        wins   = [t for t in res.trade_records if t.pnl_net > 0]
-        losses = [t for t in res.trade_records if t.pnl_net < 0]
-        avg_win   = sum(t.pnl_net for t in wins)   / len(wins)   if wins   else 0.0
-        avg_loss  = sum(t.pnl_net for t in losses)  / len(losses) if losses else 0.0
-        gross_win  = sum(t.pnl_net for t in wins)
-        gross_loss = abs(sum(t.pnl_net for t in losses))
-        pf = gross_win / gross_loss if gross_loss > 0 else float("inf")
-        if math.isnan(pf):
-            pf = 0.0
+            if pbar:
+                pbar.update(1)
+            if progress_callback:
+                try:
+                    progress_callback(idx, total)
+                except Exception:
+                    pass
 
-        results.append({
-            "ma_len":           ma,
-            "band_mult":        band_mult,
-            "tp_pct":           tp,
-            "trades":           res.trades,
-            "n_wins":           len(wins),
-            "n_losses":         len(losses),
-            "win_rate":         res.winrate,
-            "profit_factor":    pf,
-            "return_pct":       res.pnl_pct,
-            "pnl_usdt":         res.pnl_usdt,
-            "avg_win":          avg_win,
-            "avg_loss":         avg_loss,
-            "max_drawdown_pct": res.max_drawdown_pct,
-            "sharpe":           res.sharpe_ratio,
-            "_result_obj":      res,
-        })
+            if res is None or res.liquidated or res.trades < OPT_MIN_TRADES:
+                continue
 
-        if verbose and idx % milestone == 0:
-            print(f"  {idx/total*100:5.1f}%  ({idx}/{total})  valid: {len(results)}", flush=True)
+            wins      = [t for t in res.trade_records if t.pnl_net > 0]
+            losses    = [t for t in res.trade_records if t.pnl_net < 0]
+            avg_win   = sum(t.pnl_net for t in wins)   / len(wins)   if wins   else 0.0
+            avg_loss  = sum(t.pnl_net for t in losses) / len(losses) if losses else 0.0
+            gross_win  = sum(t.pnl_net for t in wins)
+            gross_loss = abs(sum(t.pnl_net for t in losses))
+            pf = gross_win / gross_loss if gross_loss > 0 else float("inf")
+            if math.isnan(pf):
+                pf = 0.0
+
+            row = {
+                "ma_len":           ma,
+                "band_mult":        band_mult,
+                "tp_pct":           tp,
+                "trades":           res.trades,
+                "n_wins":           len(wins),
+                "n_losses":         len(losses),
+                "win_rate":         res.winrate,
+                "profit_factor":    pf,
+                "return_pct":       res.pnl_pct,
+                "pnl_usdt":         res.pnl_usdt,
+                "avg_win":          avg_win,
+                "avg_loss":         avg_loss,
+                "max_drawdown_pct": res.max_drawdown_pct,
+                "sharpe":           res.sharpe_ratio,
+                "_result_obj":      res,
+            }
+            with results_lock:
+                results.append(row)
 
     if pbar:
         pbar.close()

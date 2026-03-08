@@ -76,4 +76,58 @@ SELECT ts_utc, symbol, interval, event, ma_len, band_mult, tp_pct, mc_score
 FROM params ORDER BY ts_utc DESC LIMIT 5;
 ```
 
+---
+
+## Diagnostic queries
+
+**1. Parameter drift — last 5 optimisation runs:**
+```sql
+SELECT p.ts_utc, p.symbol, p.interval, p.ma_len,
+       ROUND(p.band_mult, 4) as band_mult,
+       ROUND(p.tp_pct * 10000, 2) as tp_bp,
+       ROUND(p.pnl_pct, 2) as pnl_pct,
+       ROUND(p.mc_score, 4) as score
+FROM params p
+ORDER BY p.ts_utc DESC
+LIMIT 5;
+```
+Use this to answer "are my params drifting?". Compare MA, BandMult and TP across runs — high variance suggests regime instability.
+
+**2. Losing trade pattern — exits that cause most losses:**
+```sql
+SELECT reason,
+       COUNT(*) as n_trades,
+       ROUND(SUM(CASE WHEN pnl_net < 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 1) as loss_rate_pct,
+       ROUND(AVG(pnl_net), 4) as avg_pnl,
+       ROUND(SUM(CASE WHEN pnl_net < 0 THEN pnl_net ELSE 0 END), 4) as total_loss_usdt
+FROM trades
+GROUP BY reason
+ORDER BY total_loss_usdt ASC;
+```
+Use to identify which exit type (TRAIL_STOP, BAND_EXIT, LIQUIDATION, TP) is causing the most damage.
+
+**3. Signal drought check — time since last signal:**
+```sql
+SELECT ts_utc, symbol, signal_type, raw_band_level, blocked_by, adx, rsi
+FROM signals
+ORDER BY ts_utc DESC
+LIMIT 1;
+```
+If `ts_utc` is more than 4 hours ago, warn that signal drought may be active. Report `blocked_by` to explain why signals are not firing.
+
+**4. Hourly performance — best and worst trading hours (UTC):**
+```sql
+SELECT CAST(SUBSTR(ts_utc, 12, 2) AS INTEGER) as hour_utc,
+       COUNT(*) as trades,
+       ROUND(AVG(pnl_net), 4) as avg_pnl,
+       ROUND(SUM(pnl_net), 4) as total_pnl,
+       ROUND(SUM(CASE WHEN pnl_net > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 1) as win_rate_pct
+FROM trades
+GROUP BY hour_utc
+ORDER BY total_pnl DESC;
+```
+Identify the 3 best and 3 worst hours for profitability. Note any pattern (e.g. low-volume Asian hours vs high-volatility NY open).
+
+---
+
 Always present results clearly. If all tables are empty, say so and note the bot may not have run yet or may have crashed at startup. Never guess — only report what the DB actually contains.

@@ -96,6 +96,50 @@ for i in range(1, len(df)):
         else: rsi_blocked += 1
 ```
 
+## Signal verification — run AFTER optimisation
+After finding best params, verify signals actually fire. If `fired == 0`, flag prominently and suggest lowering `band_mult`:
+```python
+df_verify = build_indicators(df_last.copy(), ma_len=ep.ma_len, band_mult=ep.band_mult)
+raw_signals = adx_blocked = rsi_blocked = fired = 0
+adx_vals = []
+for i in range(1, len(df_verify)):
+    row, prev = df_verify.iloc[i], df_verify.iloc[i-1]
+    adx = float(row["adx"]); rsi = float(row["rsi"]) if not pd.isna(row["rsi"]) else 100.0
+    adx_vals.append(adx)
+    raw = compute_entry_signals_raw(current_row=row, prev_row=prev,
+                                    current_high=float(row["high"]), current_low=float(row["low"]))
+    if raw > 0:
+        raw_signals += 1
+        f = resolve_entry_signals(raw, adx, rsi)
+        if f > 0: fired += 1
+        elif adx >= ADX_THRESHOLD: adx_blocked += 1
+        else: rsi_blocked += 1
+
+avg_adx = float(np.mean(adx_vals)) if adx_vals else 0.0
+max_adx  = float(np.max(adx_vals))  if adx_vals else 0.0
+print(f"\n  Signal scan: raw={raw_signals}  fired={fired}  adx_blocked={adx_blocked}  rsi_blocked={rsi_blocked}")
+print(f"  ADX: avg={avg_adx:.1f}  max={max_adx:.1f}")
+if fired == 0:
+    print(f"  ⚠  NO SIGNALS FIRED — consider lowering band_mult (current={ep.band_mult:.2f}%)")
+```
+
+## Compare vs last saved params
+```python
+import json, os
+BEST_PARAMS_PATH = "/Users/partyproper/Documents/Mean Reversion Trader/data/best_params.json"
+if os.path.exists(BEST_PARAMS_PATH):
+    with open(BEST_PARAMS_PATH) as _f:
+        _prev = json.load(_f)
+    _prev_score = _prev.get("score", 0)
+    _new_score  = br.pnl_pct / (1.0 + max(br.max_drawdown_pct, 0.001))
+    _delta = _new_score - _prev_score
+    print(f"\n  Score vs last run: {_prev_score:.4f} → {_new_score:.4f}  (Δ {_delta:+.4f})")
+    if _delta < -0.5:
+        print(f"  ⚠  Score regressed significantly — regime may have changed")
+    elif _delta > 0:
+        print(f"  ✓  Score improved")
+```
+
 ## After every analysis — ALWAYS save best params back to bot
 After finding the best interval + params, ALWAYS run this to update the bot:
 ```python
