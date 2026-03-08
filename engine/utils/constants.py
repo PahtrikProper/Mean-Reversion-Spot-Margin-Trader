@@ -80,7 +80,7 @@ OPT_TP_MIN_BP       = 18    # 0.18% price move before leverage
 OPT_TP_MAX_BP       = 1100  # 11.00% price move before leverage
 
 OPT_N_RANDOM      = INIT_TRIALS
-OPT_MIN_TRADES    = 3
+OPT_MIN_TRADES    = 1
 
 RANDOM_SEED       = None     # set int for reproducible runs
 
@@ -127,7 +127,7 @@ if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
 else:
     BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-LOG_DIR         = os.path.join(BASE_DIR, "paper_logs")
+LOG_DIR         = os.path.join(BASE_DIR, "data")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 EVENT_LOG_PATH  = os.path.join(LOG_DIR, "events.log")

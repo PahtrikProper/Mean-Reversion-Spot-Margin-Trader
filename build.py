@@ -131,7 +131,7 @@ def _build(gui: bool) -> None:
     print(f"  Output : {output}")
     print()
     print("  The executable is fully self-contained.")
-    print("  Trade logs are written to  paper_logs/  next to the exe.")
+    print("  Trade logs are written to  data/  next to the exe.")
     if not gui:
         print()
         print("  Run:")
