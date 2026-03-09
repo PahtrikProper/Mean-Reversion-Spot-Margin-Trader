@@ -2,15 +2,18 @@
 
 Searches for the best combination of:
   EntryParams: ma_len, band_mult
-  ExitParams:  tp_pct
+  ExitParams:  tp_pct, sl_pct
 
 ADX_THRESHOLD (25) and RSI_NEUTRAL_LO (40) are fixed — not optimised.
 
 band_mult is stored as an integer × 10 (3 = 0.3, 100 = 10.0) during search
 for efficient integer arithmetic, then converted to float for EntryParams.
 
-tp_pct is optimised in the range OPT_TP_MIN_BP–OPT_TP_MAX_BP (basis points * 0.0001).
-  e.g. 18 bp = 0.18% price move before leverage.  No stop-loss.  No time exit.
+tp_pct is optimised in OPT_TP_MIN_BP–OPT_TP_MAX_BP (basis points × 0.0001).
+  e.g. 18 bp = 0.18% price move before leverage.
+
+sl_pct is optimised in OPT_SL_MIN_BP–OPT_SL_MAX_BP (basis points × 0.0001).
+  e.g. 500 bp = 5.00% above entry.  Wide by design — pre-liquidation guard.
 
 Uses randomised search with exploitation/exploration split:
   EXPLOIT_RATIO of trials are sampled near the previously saved best params.
@@ -35,9 +38,11 @@ from tqdm import tqdm
 from ..utils.constants import (
     STARTING_WALLET,
     DEFAULT_TP_PCT,
+    STOP_LOSS_PCT,
     OPT_MA_LEN_MIN,        OPT_MA_LEN_MAX,
     OPT_BAND_MULT_X10_MIN, OPT_BAND_MULT_X10_MAX,
     OPT_TP_MIN_BP,         OPT_TP_MAX_BP,
+    OPT_SL_MIN_BP,         OPT_SL_MAX_BP,
     OPT_N_RANDOM,
     OPT_MIN_TRADES,
     RANDOM_SEED,
@@ -45,6 +50,7 @@ from ..utils.constants import (
     EXPLOIT_MA_LEN_RADIUS,
     EXPLOIT_BAND_MULT_RADIUS_X10,
     EXPLOIT_TP_RADIUS_BP,
+    EXPLOIT_SL_RADIUS_BP,
     TIME_TP_HOURS,
     TIME_TP_FALLBACK_PCT,
     TIME_TP_SCALE,
@@ -76,12 +82,12 @@ def optimise_params(
     db_interval: Optional[str] = None,
     db_trigger: str = "STARTUP",
 ) -> Dict[str, Any]:
-    """Random search over (ma_len, band_mult, tp_pct).
+    """Random search over (ma_len, band_mult, tp_pct, sl_pct).
 
     band_mult is searched as integer × 10 for efficiency, converted to float for params.
     ADX_THRESHOLD=25 and RSI_NEUTRAL_LO=40 are fixed constants (not optimised).
     tp_pct is optimised in range OPT_TP_MIN_BP–OPT_TP_MAX_BP (0.18–11.00% price move).
-    No stop-loss.  No time exit.
+    sl_pct is optimised in range OPT_SL_MIN_BP–OPT_SL_MAX_BP (0.50–9.00% above entry).
 
     Returns dict:
         {
@@ -119,6 +125,9 @@ def optimise_params(
         b_tp_bp = int(np.clip(
             round(float(saved_best.get("tp_pct", DEFAULT_TP_PCT)) * 10000),
             OPT_TP_MIN_BP, OPT_TP_MAX_BP))
+        b_sl_bp = int(np.clip(
+            round(float(saved_best.get("sl_pct", STOP_LOSS_PCT)) * 10000),
+            OPT_SL_MIN_BP, OPT_SL_MAX_BP))
 
         attempts = 0
         while len(combos) < n_exploit and attempts < n_exploit * 20:
@@ -133,7 +142,10 @@ def optimise_params(
             tp_bp = int(np.clip(
                 rng.integers(b_tp_bp - EXPLOIT_TP_RADIUS_BP, b_tp_bp + EXPLOIT_TP_RADIUS_BP + 1),
                 OPT_TP_MIN_BP, OPT_TP_MAX_BP))
-            key = (ma, bm_x10, tp_bp)
+            sl_bp = int(np.clip(
+                rng.integers(b_sl_bp - EXPLOIT_SL_RADIUS_BP, b_sl_bp + EXPLOIT_SL_RADIUS_BP + 1),
+                OPT_SL_MIN_BP, OPT_SL_MAX_BP))
+            key = (ma, bm_x10, tp_bp, sl_bp)
             if key not in seen:
                 seen.add(key)
                 combos.append(key)
@@ -145,7 +157,8 @@ def optimise_params(
         ma     = int(rng.integers(OPT_MA_LEN_MIN,        OPT_MA_LEN_MAX        + 1))
         bm_x10 = int(rng.integers(OPT_BAND_MULT_X10_MIN, OPT_BAND_MULT_X10_MAX + 1))
         tp_bp  = int(rng.integers(OPT_TP_MIN_BP,          OPT_TP_MAX_BP         + 1))
-        key = (ma, bm_x10, tp_bp)
+        sl_bp  = int(rng.integers(OPT_SL_MIN_BP,          OPT_SL_MAX_BP         + 1))
+        key = (ma, bm_x10, tp_bp, sl_bp)
         if key not in seen:
             seen.add(key)
             combos.append(key)
@@ -155,7 +168,8 @@ def optimise_params(
         print(f"\nTesting {total} param combos  [{event_name}]")
         print(f"  Entry — MA-len {OPT_MA_LEN_MIN}-{OPT_MA_LEN_MAX}  "
               f"BandMult {OPT_BAND_MULT_X10_MIN/10:.1f}-{OPT_BAND_MULT_X10_MAX/10:.1f}%")
-        print(f"  Exit  — TP {OPT_TP_MIN_BP*0.01:.2f}%-{OPT_TP_MAX_BP*0.01:.2f}% (band exit, trail stop, no SL, no time exit)")
+        print(f"  Exit  — TP {OPT_TP_MIN_BP*0.01:.2f}%-{OPT_TP_MAX_BP*0.01:.2f}%  "
+              f"SL {OPT_SL_MIN_BP*0.01:.2f}%-{OPT_SL_MAX_BP*0.01:.2f}%  (band exit, no time exit)")
         if saved_best:
             print(f"  Mode: {n_exploit} exploitation + {len(combos)-n_exploit} exploration")
         else:
@@ -191,23 +205,24 @@ def optimise_params(
     n_workers    = min(os.cpu_count() or 2, 2)
 
     def _run_trial(combo):
-        ma, bm_x10, tp_bp = combo
+        ma, bm_x10, tp_bp, sl_bp = combo
         band_mult = bm_x10 / 10.0
         tp = tp_bp * 0.0001
+        sl = sl_bp * 0.0001
         ep = EntryParams(ma_len=ma, band_mult=band_mult)
-        xp = ExitParams(tp_pct=tp)
+        xp = ExitParams(tp_pct=tp, sl_pct=sl)
         res = backtest_once(
             dfl, dfm, risk_df, ep, xp, leverage, fee_rate, maker_fee_rate,
             time_tp_pct=_time_tp_pct,
             interval_minutes_bt=interval_minutes,
         )
-        return ma, bm_x10, tp_bp, band_mult, tp, res
+        return ma, bm_x10, tp_bp, sl_bp, band_mult, tp, sl, res
 
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         futures = {executor.submit(_run_trial, combo): combo for combo in combos}
         for future in as_completed(futures):
             try:
-                ma, bm_x10, tp_bp, band_mult, tp, res = future.result()
+                ma, bm_x10, tp_bp, sl_bp, band_mult, tp, sl, res = future.result()
             except Exception as _exc:
                 log.debug(f"[OPT] Trial raised: {_exc}")
                 res = None
@@ -241,6 +256,7 @@ def optimise_params(
                 "ma_len":           ma,
                 "band_mult":        band_mult,
                 "tp_pct":           tp,
+                "sl_pct":           sl,
                 "trades":           res.trades,
                 "n_wins":           len(wins),
                 "n_losses":         len(losses),
@@ -274,6 +290,7 @@ def optimise_params(
     )
     best_exit = ExitParams(
         tp_pct=best["tp_pct"],
+        sl_pct=best["sl_pct"],
     )
     best_res = best["_result_obj"]
 
@@ -282,7 +299,7 @@ def optimise_params(
         print(
             f"\n✓ OPTIMISATION COMPLETE [{event_name}]:\n"
             f"  Entry — MA-len={best_entry.ma_len}  BandMult={best_entry.band_mult:.2f}%\n"
-            f"  Exit  — TP={best_exit.tp_pct*100:.2f}%\n"
+            f"  Exit  — TP={best_exit.tp_pct*100:.2f}%  SL={best_exit.sl_pct*100:.2f}%\n"
             f"  Wins={best['n_wins']}  Losses={best['n_losses']}  WinRate={best['win_rate']:.1f}%  "
             f"PF={pf_str}  Return={best['return_pct']:.2f}%  Trades={best['trades']}\n"
         )

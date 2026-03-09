@@ -55,13 +55,13 @@ DEFAULT_MA_LEN       = 100    # RMA period for band centre line
 DEFAULT_BAND_MULT    = 2.5    # Band width multiplier (%)
 DEFAULT_TP_PCT       = 0.0028 # 0.28% take-profit (optimised; ~midpoint of range)
 
-# ── Jason McIntosh ATR trailing stop (SHORT exit) ─────────────────────────────
-# Formula: stop = min_low_since_entry + TRAIL_ATR_MULT × ATR(TRAIL_ATR_PERIOD)
-# Exit SHORT when: current_high >= trail_stop
-# As price falls (trade going in our favour), min_low_since_entry decreases
-# → trail_stop also falls, locking in more profit on the way down.
-TRAIL_ATR_PERIOD = 14    # Wilder ATR lookback period
-TRAIL_ATR_MULT   = 3.0   # ATR multiplier (3× ATR above lowest low since entry)
+# ── Hard stop-loss (SHORT exit) ───────────────────────────────────────────────
+# Fires when: current_high >= entry_price * (1 + sl_pct)
+# Intentionally wide — designed to prevent full liquidation, not to be
+# routinely triggered.  Optimised alongside TP.
+# Typical optimised range: 0.50–9.00% above entry (stays inside liq at ~10%
+# for 10× leverage; liquidation threshold varies with margin fraction).
+STOP_LOSS_PCT = 0.05     # default 5.0% above entry (optimised at runtime)
 
 # ── Optimiser search ranges ───────────────────────────────────────────────────
 INIT_TRIALS          = 4000
@@ -79,6 +79,11 @@ OPT_BAND_MULT_X10_MAX = 100  # 10.0%
 OPT_TP_MIN_BP       = 18    # 0.18% price move before leverage
 OPT_TP_MAX_BP       = 1100  # 11.00% price move before leverage
 
+# Stop-loss (in basis points; 50 = 0.50%, 900 = 9.00%)
+# Upper bound kept below liquidation threshold (~10% for 10× leverage).
+OPT_SL_MIN_BP       = 50    # 0.50% above entry
+OPT_SL_MAX_BP       = 900   # 9.00% above entry
+
 OPT_N_RANDOM      = INIT_TRIALS
 OPT_MIN_TRADES    = 1
 
@@ -89,6 +94,7 @@ EXPLOIT_RATIO                = 0.60
 EXPLOIT_MA_LEN_RADIUS        = 15
 EXPLOIT_BAND_MULT_RADIUS_X10 = 3    # ±0.3 around saved best band_mult
 EXPLOIT_TP_RADIUS_BP         = 50   # ±0.50% around saved best TP
+EXPLOIT_SL_RADIUS_BP         = 50   # ±0.50% around saved best SL
 
 # ── Runtime behaviour ─────────────────────────────────────────────────────────
 KEEP_CANDLES            = 3000

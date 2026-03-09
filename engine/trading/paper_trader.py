@@ -3,7 +3,7 @@
 Uses public REST endpoints (klines, risk tiers, instrument info) and the
 public Bybit WebSocket for live candle and mark-price data.
 
-Simulates wallet, fills (close + slippage), TP, trail stop,
+Simulates wallet, fills (close + slippage), TP, stop-loss,
 band exit, and liquidation using exactly the same logic as LiveRealTrader.
 No real orders are ever placed.
 """
@@ -110,10 +110,9 @@ class PaperTrader:
         self.last_reopt_time     = time.time()
         self._reopt_running: bool = False
 
-        self._entry_time: Optional[pd.Timestamp]  = None
-        self._entry_price: Optional[float]        = None
-        self._min_low_since_entry: Optional[float] = None
-        self._time_tp_applied: bool               = False  # True once 12h TP tightening fires
+        self._entry_time: Optional[pd.Timestamp] = None
+        self._entry_price: Optional[float]       = None
+        self._time_tp_applied: bool              = False  # True once 12h TP tightening fires
 
         self.trade_count      = 0
         self.win_count        = 0
@@ -146,7 +145,6 @@ class PaperTrader:
             base,
             ma_len=self.entry_params.ma_len,
             band_mult=self.entry_params.band_mult,
-            trail_atr_period=self.exit_params.trail_atr_period,
         )
 
     # ── Instrument helpers (identical to LiveRealTrader) ───────────────────────
@@ -375,12 +373,11 @@ class PaperTrader:
             self.position              = None
             self._paper_margin         = 0.0
             self._paper_tp_price       = None
-            self._paper_liq_price      = None
-            self._paper_entry_fee      = 0.0
-            self._entry_time           = None
-            self._entry_price          = None
-            self._min_low_since_entry  = None
-            self._time_tp_applied      = False
+            self._paper_liq_price = None
+            self._paper_entry_fee = 0.0
+            self._entry_time      = None
+            self._entry_price     = None
+            self._time_tp_applied = False
             self.gate.release(self.symbol)
             self._update_account_pnl()
 
@@ -618,7 +615,7 @@ class PaperTrader:
         Exit priority (identical to backtester and LiveRealTrader):
           1. Liquidation   — mark_price >= liq_price
           2. Take-Profit   — candle low <= tp_price
-          3. Trail Stop    — high >= min_low_since_entry + mult×ATR
+          3. Stop-Loss     — high >= entry * (1 + sl_pct)
           4. Band Exit     — low drops below discount band
         """
         try:
@@ -754,16 +751,12 @@ class PaperTrader:
             _sh_to_remove = []
             for _sh in self._shadow_positions:
                 _sh["candles"] += 1
-                _sh["min_low"]  = min(_sh["min_low"], l)
-                _sh_atr = atr_val if atr_val > 0 else _sh.get("atr_at_entry", 0.0)
-                if _sh_atr > 0:
-                    _sh["trail_stop"] = _sh["min_low"] + float(self.exit_params.trail_atr_mult) * _sh_atr
                 _sh_outcome = None
                 _sh_out_px  = None
                 if l <= _sh["tp_price"]:
-                    _sh_outcome = "TP_HIT";       _sh_out_px = _sh["tp_price"]
-                elif h >= _sh["trail_stop"]:
-                    _sh_outcome = "TRAIL_STOPPED"; _sh_out_px = _sh["trail_stop"]
+                    _sh_outcome = "TP_HIT"; _sh_out_px = _sh["tp_price"]
+                elif h >= _sh["sl_price"]:
+                    _sh_outcome = "SL_HIT"; _sh_out_px = _sh["sl_price"]
                 elif _sh["candles"] >= 100:
                     _sh_outcome = "EXPIRED"
                 if _sh_outcome:
@@ -775,7 +768,7 @@ class PaperTrader:
                             symbol=self.symbol, interval=self.interval,
                             blocked_by=_sh["blocked_by"],
                             entry_price=_sh["entry_price"], tp_price=_sh["tp_price"],
-                            trail_stop_at_resolution=_sh["trail_stop"],
+                            trail_stop_at_resolution=_sh["sl_price"],
                             band=_sh["band"],
                             adx_at_entry=_sh.get("adx_at_entry"),
                             rsi_at_entry=_sh.get("rsi_at_entry"),
@@ -801,9 +794,10 @@ class PaperTrader:
         )
 
         # ── DB: signal ──
-        _trail_stop_lvl = None
-        if self.position is not None and self._min_low_since_entry is not None and atr_val > 0:
-            _trail_stop_lvl = self._min_low_since_entry + float(self.exit_params.trail_atr_mult) * atr_val
+        _sl_price_lvl = (
+            self._entry_price * (1.0 + float(self.exit_params.sl_pct))
+            if self.position is not None and self._entry_price is not None else None
+        )
 
         if entry_sig:
             _sig_type  = "ENTRY"
@@ -811,8 +805,8 @@ class PaperTrader:
         elif _raw_exit > 0:
             _sig_type  = "EXIT_BAND"
             _blocked   = None
-        elif _trail_stop_lvl is not None and h >= _trail_stop_lvl:
-            _sig_type  = "EXIT_TRAIL"
+        elif _sl_price_lvl is not None and h >= _sl_price_lvl:
+            _sig_type  = "EXIT_SL"
             _blocked   = None
         else:
             _sig_type  = "NONE"
@@ -820,16 +814,16 @@ class PaperTrader:
             if _raw_short > 0 and _final_short == 0:
                 _blocked_entry = "ADX" if adx_val >= 25 else "RSI"
                 # ── Shadow for indicator-blocked signal ───────────────────────
-                if self.position is None and atr_val > 0 and len(self._shadow_positions) < 5:
+                if self.position is None and len(self._shadow_positions) < 5:
                     _sh_ep  = c
                     _sh_tp  = _sh_ep * (1.0 - float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
-                    _sh_trl = l + float(self.exit_params.trail_atr_mult) * atr_val
+                    _sh_sl  = _sh_ep * (1.0 + float(self.exit_params.sl_pct))
                     self._shadow_positions.append({
                         "entry_ts": ts_utc, "entry_price": _sh_ep,
-                        "tp_price": _sh_tp, "trail_stop": _sh_trl,
-                        "min_low": l, "band": _raw_short, "blocked_by": _blocked_entry,
+                        "tp_price": _sh_tp, "sl_price": _sh_sl,
+                        "band": _raw_short, "blocked_by": _blocked_entry,
                         "candles": 0, "adx_at_entry": adx_val,
-                        "rsi_at_entry": rsi_val, "atr_at_entry": atr_val,
+                        "rsi_at_entry": rsi_val,
                     })
             _blocked = _blocked_entry
 
@@ -838,7 +832,7 @@ class PaperTrader:
             signal_type=_sig_type,
             raw_band_level=_raw_short, final_band_level=_final_short,
             adx=adx_val, rsi=rsi_val, atr=atr_val if atr_val else None,
-            trail_stop_level=_trail_stop_lvl,
+            trail_stop_level=_sl_price_lvl,
             blocked_by=_blocked,
             o=o, h=h, l=l, c=c,
             ma_len=self.entry_params.ma_len,
@@ -852,7 +846,6 @@ class PaperTrader:
             _upnl     = (self.position.entry_price - self.mark_price) * _qty_abs
             _tp_snap  = self._paper_tp_price
             _ts_entry = self._entry_time.strftime("%Y-%m-%d %H:%M:%S") if self._entry_time else None
-            _trail_snap = _trail_stop_lvl
             _db.log_position(
                 ts_utc=ts_utc, symbol=self.symbol,
                 qty=-_qty_abs,
@@ -861,8 +854,8 @@ class PaperTrader:
                 mark_price=self.mark_price,
                 liquidation_price=self._paper_liq_price,
                 unrealized_pnl=_upnl,
-                min_low_since_entry=self._min_low_since_entry,
-                trail_stop_price=_trail_snap,
+                min_low_since_entry=None,
+                trail_stop_price=_sl_price_lvl,
                 tp_price=_tp_snap,
                 wallet=self.wallet,
             )
@@ -875,10 +868,6 @@ class PaperTrader:
                 min_low_since_entry=None, trail_stop_price=None,
                 tp_price=None, wallet=self.wallet,
             )
-
-        # ── Update trail stop tracking ──
-        if self.position is not None and self._min_low_since_entry is not None:
-            self._min_low_since_entry = min(self._min_low_since_entry, l)
 
         # ── Time-based TP tightening (20h after entry → data-driven tighter TP) ──
         if (self.position is not None
@@ -974,15 +963,14 @@ class PaperTrader:
                 )
 
                 # Entire margin is forfeited — wallet stays as post-entry value
-                self.position             = None
-                self._paper_margin        = 0.0
-                self._paper_tp_price      = None
-                self._paper_liq_price     = None
-                self._paper_entry_fee     = 0.0
-                self._entry_time          = None
-                self._entry_price         = None
-                self._min_low_since_entry = None
-                self._time_tp_applied     = False
+                self.position         = None
+                self._paper_margin    = 0.0
+                self._paper_tp_price  = None
+                self._paper_liq_price = None
+                self._paper_entry_fee = 0.0
+                self._entry_time      = None
+                self._entry_price     = None
+                self._time_tp_applied = False
                 self.gate.release(self.symbol)
                 self._update_account_pnl()
                 acted = True
@@ -993,23 +981,21 @@ class PaperTrader:
                 self._execute_exit(self._paper_tp_price, "TP", ts_utc)
                 acted = True
 
-        # ── Jason McIntosh trail stop signal ──
-        trail_stop_exit = False
-        if self.position is not None and self._min_low_since_entry is not None:
-            trail_atr_val = float(row["atr"]) if "atr" in self.df.columns and not pd.isna(row["atr"]) else 0.0
-            if trail_atr_val > 0:
-                trail_stop_lvl = self._min_low_since_entry + float(self.exit_params.trail_atr_mult) * trail_atr_val
-                if h >= trail_stop_lvl:
-                    trail_stop_exit = True
+        # ── Hard stop-loss signal ──
+        sl_exit = False
+        if self.position is not None and self._entry_price is not None:
+            sl_price = self._entry_price * (1.0 + float(self.exit_params.sl_pct))
+            if h >= sl_price:
+                sl_exit = True
 
         if entry_sig:
             self.last_signal = {"type": "ENTRY", "time": ts_utc, "placed": False, "filled": False, "price": None, "band": _raw_short}
-        elif exit_sig or trail_stop_exit:
+        elif exit_sig or sl_exit:
             self.last_signal = {"type": "EXIT",  "time": ts_utc, "placed": False, "filled": False, "price": None, "band": _raw_short}
 
-        # ── Priority 3: Trail stop exit ──
-        if not acted and trail_stop_exit and self.position is not None:
-            self._execute_exit(c, "TRAIL_STOP", ts_utc)
+        # ── Priority 3: Stop-loss exit ──
+        if not acted and sl_exit and self.position is not None:
+            self._execute_exit(c, "STOP_LOSS", ts_utc)
             acted = True
 
         # ── Priority 4: Band exit ──
@@ -1021,35 +1007,33 @@ class PaperTrader:
         if not acted and entry_sig and self.position is None and not self._halted:
             if self.wallet >= MIN_WALLET_USDT:
                 self._execute_entry(c, ts_utc, ts)
-                if self.position is not None and self._min_low_since_entry is None:
-                    self._min_low_since_entry = l
             else:
                 log.warning(f"[PAPER][{ts_utc}] Entry signal — wallet {self.wallet:.4f} < {MIN_WALLET_USDT}")
                 # ── Shadow for wallet-blocked signal ─────────────────────
-                if atr_val > 0 and len(self._shadow_positions) < 5:
+                if len(self._shadow_positions) < 5:
                     _sh_ep  = c
                     _sh_tp  = _sh_ep * (1.0 - float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
-                    _sh_trl = l + float(self.exit_params.trail_atr_mult) * atr_val
+                    _sh_sl  = _sh_ep * (1.0 + float(self.exit_params.sl_pct))
                     self._shadow_positions.append({
                         "entry_ts": ts_utc, "entry_price": _sh_ep,
-                        "tp_price": _sh_tp, "trail_stop": _sh_trl,
-                        "min_low": l, "band": _raw_short, "blocked_by": "WALLET",
+                        "tp_price": _sh_tp, "sl_price": _sh_sl,
+                        "band": _raw_short, "blocked_by": "WALLET",
                         "candles": 0, "adx_at_entry": adx_val,
-                        "rsi_at_entry": rsi_val, "atr_at_entry": atr_val,
+                        "rsi_at_entry": rsi_val,
                     })
         elif entry_sig and self.position is not None:
             log.info(f"[PAPER][{ts_utc}] Entry signal — already SHORT (no pyramiding)")
             # ── Shadow for position-blocked signal ───────────────────────
-            if atr_val > 0 and len(self._shadow_positions) < 5:
+            if len(self._shadow_positions) < 5:
                 _sh_ep  = c
                 _sh_tp  = _sh_ep * (1.0 - float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
-                _sh_trl = l + float(self.exit_params.trail_atr_mult) * atr_val
+                _sh_sl  = _sh_ep * (1.0 + float(self.exit_params.sl_pct))
                 self._shadow_positions.append({
                     "entry_ts": ts_utc, "entry_price": _sh_ep,
-                    "tp_price": _sh_tp, "trail_stop": _sh_trl,
-                    "min_low": l, "band": _raw_short, "blocked_by": "POSITION",
+                    "tp_price": _sh_tp, "sl_price": _sh_sl,
+                    "band": _raw_short, "blocked_by": "POSITION",
                     "candles": 0, "adx_at_entry": adx_val,
-                    "rsi_at_entry": rsi_val, "atr_at_entry": atr_val,
+                    "rsi_at_entry": rsi_val,
                 })
 
         # ── Display ──

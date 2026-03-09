@@ -9,8 +9,7 @@ Entry (SHORT only):
 
 Exit:
   TP:          low  <= entry * (1 - tp_pct)
-  Trail Stop:  high >= min_low_since_entry + trail_atr_mult * ATR(trail_atr_period)
-               (Jason McIntosh ATR trailing stop — SHORT version)
+  Stop-Loss:   high >= entry * (1 + sl_pct)   [wide, pre-liquidation guard]
   Band exit:   low  drops below discount_k band (mirrors entry logic)
 """
 
@@ -222,7 +221,6 @@ def build_indicators(
     df_raw: pd.DataFrame,
     ma_len: int,
     band_mult: float,
-    trail_atr_period: int = 14,
 ) -> pd.DataFrame:
     """Build all indicators needed for entry and exit.
 
@@ -234,12 +232,12 @@ def build_indicators(
         discount_1..8  — EMA-smoothed discount bands  (exit signals)
         adx            — ADX(14) Wilder (entry gate)
         rsi            — RSI(14) Wilder (entry gate)
-        atr            — ATR(trail_atr_period) Wilder (Jason McIntosh trail stop)
+        atr            — ATR(14) Wilder  (retained for diagnostic DB logging)
     """
     df = build_bands(df_raw.copy(), ma_len, band_mult)
     df["adx"] = calculate_adx(df, ADX_PERIOD)
     df["rsi"] = calculate_rsi(df, RSI_PERIOD)
-    df["atr"] = calculate_atr(df, trail_atr_period)
+    df["atr"] = calculate_atr(df, ADX_PERIOD)   # ADX_PERIOD = 14
     return df
 
 

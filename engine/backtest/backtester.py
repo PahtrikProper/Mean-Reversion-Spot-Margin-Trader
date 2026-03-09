@@ -11,7 +11,7 @@ Entry:
 Exit priority per candle:
   1. Liquidation  (mark high >= liq_price)
   2. Take-profit  (last low  <= tp_price)                       [fixed TP, optimised]
-  3. Trail Stop   (last high >= min_low_since_entry + mult×ATR) [Jason McIntosh, SHORT]
+  3. Stop-Loss    (last high >= entry * (1 + sl_pct))           [wide, pre-liquidation guard]
   4. Band exit    (last low drops below discount_k band)        [mirrors entry logic]
 
 No hard stop-loss. Trail stop trails DOWN as price falls (locking in profit for SHORT).
@@ -109,7 +109,6 @@ def backtest_once(
         dfl,
         ma_len=entry_params.ma_len,
         band_mult=entry_params.band_mult,
-        trail_atr_period=exit_params.trail_atr_period,
     )
 
     # ── Backtest loop ─────────────────────────────────────────────────────────
@@ -120,7 +119,6 @@ def backtest_once(
     wallet_at_entry      = 0.0
     in_position          = False
     liquidated           = False
-    min_low_since_entry  = float("inf")  # Jason McIntosh trail stop tracking
 
     # Time-based TP tightening — tracks when entry occurred and whether applied
     entry_candle_idx:   int  = 0
@@ -151,9 +149,6 @@ def backtest_once(
         if in_position and pos_qty != 0.0:
             qty_abs = abs(pos_qty)
             tier    = pick_risk_tier(risk_df, qty_abs * mark_close)
-
-            # Track lowest low since entry for Jason McIntosh trail stop
-            min_low_since_entry = min(min_low_since_entry, low_last)
 
             # 1. Liquidation (mark price)
             liq = liquidation_price_short_isolated(
@@ -201,35 +196,31 @@ def backtest_once(
                 ))
                 pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                 wallet_at_entry = 0.0; in_position = False
-                min_low_since_entry = float("inf")
                 entry_candle_idx = 0; time_tp_applied = False
                 exited = True
 
-            # 3. Jason McIntosh ATR trailing stop (SHORT)
-            # trail_stop = min_low_since_entry + trail_atr_mult × ATR
-            # Exit when high crosses ABOVE the trailing stop level.
+            # 3. Hard stop-loss (price rises above entry * (1 + sl_pct))
+            # Wide by design — fires before liquidation, rarely triggered in
+            # normal conditions.  Optimised alongside TP.
             if not exited and pos_qty != 0.0:
-                trail_atr_val = float(row["atr"]) if not pd.isna(row["atr"]) else 0.0
-                if trail_atr_val > 0:
-                    trail_stop = min_low_since_entry + float(exit_params.trail_atr_mult) * trail_atr_val
-                    if high_last >= trail_stop:
-                        fill      = _apply_slippage(close, "buy")
-                        pnl_gross = (entry_price_bt - fill) * qty_abs
-                        exit_fee  = (qty_abs * fill) * fee_rate
-                        wallet   += pnl_gross - exit_fee
-                        pnl_net   = pnl_gross - entry_fee - exit_fee
-                        trade_pnls.append(pnl_net)
-                        trade_records.append(TradeRecord(
-                            side="SHORT", entry_price=entry_price_bt, exit_price=fill,
-                            qty=qty_abs, entry_fee=entry_fee, exit_fee=exit_fee,
-                            pnl_gross=pnl_gross, pnl_net=pnl_net,
-                            reason="TRAIL_STOP", wallet_at_entry=wallet_at_entry,
-                        ))
-                        pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
-                        wallet_at_entry = 0.0; in_position = False
-                        min_low_since_entry = float("inf")
-                        entry_candle_idx = 0; time_tp_applied = False
-                        exited = True
+                sl_price = entry_price_bt * (1.0 + float(exit_params.sl_pct))
+                if high_last >= sl_price:
+                    fill      = _apply_slippage(close, "buy")
+                    pnl_gross = (entry_price_bt - fill) * qty_abs
+                    exit_fee  = (qty_abs * fill) * fee_rate
+                    wallet   += pnl_gross - exit_fee
+                    pnl_net   = pnl_gross - entry_fee - exit_fee
+                    trade_pnls.append(pnl_net)
+                    trade_records.append(TradeRecord(
+                        side="SHORT", entry_price=entry_price_bt, exit_price=fill,
+                        qty=qty_abs, entry_fee=entry_fee, exit_fee=exit_fee,
+                        pnl_gross=pnl_gross, pnl_net=pnl_net,
+                        reason="STOP_LOSS", wallet_at_entry=wallet_at_entry,
+                    ))
+                    pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
+                    wallet_at_entry = 0.0; in_position = False
+                    entry_candle_idx = 0; time_tp_applied = False
+                    exited = True
 
             # 4. Band exit (low drops below discount_k — mirrors premium band entry)
             if not exited and pos_qty != 0.0:
@@ -253,7 +244,6 @@ def backtest_once(
                     ))
                     pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                     wallet_at_entry = 0.0; in_position = False
-                    min_low_since_entry = float("inf")
                     entry_candle_idx = 0; time_tp_applied = False
                     exited = True
 
@@ -274,9 +264,8 @@ def backtest_once(
                 pos_qty              = -qty
                 entry_price_bt       = fill
                 entry_fee            = fee
-                in_position          = True
-                min_low_since_entry  = low_last  # initialise trail stop tracking
-                entry_candle_idx     = i          # record candle index for time TP
+                in_position      = True
+                entry_candle_idx = i          # record candle index for time TP
                 time_tp_applied      = False
 
         # ── Equity snapshot ───────────────────────────────────────────────────

@@ -9,8 +9,7 @@ from .constants import (
     DEFAULT_MA_LEN,
     DEFAULT_BAND_MULT,
     DEFAULT_TP_PCT,
-    TRAIL_ATR_PERIOD,
-    TRAIL_ATR_MULT,
+    STOP_LOSS_PCT,
 )
 
 
@@ -25,7 +24,7 @@ class TradeRecord:
     exit_fee:        float
     pnl_gross:       float
     pnl_net:         float
-    reason:          str           # "TP", "TIME_TP", "TRAIL_STOP", "BAND_EXIT", "LIQUIDATION"
+    reason:          str           # "TP", "TIME_TP", "STOP_LOSS", "BAND_EXIT", "LIQUIDATION"
     wallet_at_entry: float = 0.0
 
     @property
@@ -96,16 +95,15 @@ class ExitParams:
     Exit fires on (full system priority order):
         1. Liquidation  mark_high >= liq_price                        [not a param — handled externally]
         2. TP:          low  <= entry * (1 - tp_pct)                  [optimised]
-        3. Trail Stop:  high >= min_low_since_entry + mult × ATR       [Jason McIntosh]
+        3. Stop-Loss:   high >= entry * (1 + sl_pct)                  [optimised — wide, pre-liquidation guard]
         4. Band:        low drops below discount_k band                [mirrors entry logic]
 
-    No hard stop-loss — TP, trail stop, and band exits only.
-    Trail stop trails DOWN as price falls (SHORT), locking in profit.
-    Exit signal: current HIGH crosses above the trail stop level.
+    SL is intentionally wide (default 5%) — intended to prevent full account
+    liquidation, not to be routinely triggered.  Optimised alongside TP so
+    the backtest finds the widest SL that still protects the account.
     """
-    tp_pct:           float = DEFAULT_TP_PCT    # take-profit fraction (e.g. 0.0028 = 0.28%)
-    trail_atr_period: int   = TRAIL_ATR_PERIOD  # ATR lookback for Jason McIntosh trail stop
-    trail_atr_mult:   float = TRAIL_ATR_MULT    # ATR multiplier (stop = min_low + mult×ATR)
+    tp_pct: float = DEFAULT_TP_PCT  # take-profit fraction (e.g. 0.0028 = 0.28%)
+    sl_pct: float = STOP_LOSS_PCT   # stop-loss fraction above entry (e.g. 0.05 = 5.0%)
 
 
 # Legacy alias

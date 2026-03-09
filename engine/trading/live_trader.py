@@ -4,12 +4,9 @@ Entry:  high drops back below premium_k band (crossover)
         AND ADX < 25  (range-bound regime)
         AND RSI >= 40 (not deeply oversold)
 Exit:   TP hit (Bybit server-side TP)
-        OR trail stop: high >= min_low_since_entry + mult×ATR  (Jason McIntosh)
+        OR stop-loss: high >= entry * (1 + sl_pct)  [wide, pre-liquidation guard]
         OR band exit: low drops below discount_k band (mirrors entry logic)
         OR liquidation (detected via REST poll)
-
-No hard stop-loss — TP, trail stop, and band exits only.
-Trail stop trails DOWN as price falls for the SHORT, locking in profit.
 """
 
 import pandas as pd
@@ -130,7 +127,6 @@ class LiveRealTrader:
         self._halt_ts: Optional[float]   = None           # when halt started
         self._refresh_failed: bool       = False          # True when last REST refresh failed
         self._last_entry_fee: float = 0.0  # entry fee stored for accurate exit PnL
-        self._min_low_since_entry: Optional[float] = None  # Jason McIntosh trail stop
         self._reopt_running: bool = False  # guard against concurrent reopt threads
         self._time_tp_applied: bool = False  # True once 12h TP tightening fires
         self._shadow_positions: list = []  # virtual "what if" trades for gate-blocked signals
@@ -149,7 +145,6 @@ class LiveRealTrader:
             base,
             ma_len=self.entry_params.ma_len,
             band_mult=self.entry_params.band_mult,
-            trail_atr_period=self.exit_params.trail_atr_period,
         )
 
     # ── Order helpers ─────────────────────────────────────────────────────────
@@ -420,12 +415,11 @@ class LiveRealTrader:
                 entry_price=entry_price, wallet_before=wallet_before,
                 wallet_after=self.wallet,
             )
-            self._entry_time           = None   # clear entry state on exit
-            self._entry_price          = None
-            self._wallet_at_entry      = None
-            self._last_entry_fee       = 0.0
-            self._min_low_since_entry  = None   # reset trail stop tracking
-            self._time_tp_applied      = False
+            self._entry_time      = None   # clear entry state on exit
+            self._entry_price     = None
+            self._wallet_at_entry = None
+            self._last_entry_fee  = 0.0
+            self._time_tp_applied = False
         except Exception as e:
             log_order(ts_utc=ts_utc, symbol=self.symbol, side="SHORT",
                       qty=qty_to_close if qty_to_close else qty_abs,
@@ -501,12 +495,11 @@ class LiveRealTrader:
 
         # Reset all position-tracking state and release the slot.
         self.gate.release(self.symbol)
-        self._entry_time          = None
-        self._entry_price         = None
-        self._wallet_at_entry     = None
-        self._last_entry_fee      = 0.0
-        self._min_low_since_entry = None   # reset trail stop tracking
-        self._time_tp_applied     = False
+        self._entry_time      = None
+        self._entry_price     = None
+        self._wallet_at_entry = None
+        self._last_entry_fee  = 0.0
+        self._time_tp_applied = False
 
     # ── Trade log ──────────────────────────────────────────────────────────────
 
@@ -896,16 +889,12 @@ class LiveRealTrader:
                 _sh_to_remove = []
                 for _sh in self._shadow_positions:
                     _sh["candles"] += 1
-                    _sh["min_low"]  = min(_sh["min_low"], l)
-                    _sh_atr = atr_val if atr_val > 0 else _sh.get("atr_at_entry", 0.0)
-                    if _sh_atr > 0:
-                        _sh["trail_stop"] = _sh["min_low"] + float(self.exit_params.trail_atr_mult) * _sh_atr
                     _sh_outcome = None
                     _sh_out_px  = None
                     if l <= _sh["tp_price"]:
-                        _sh_outcome = "TP_HIT";       _sh_out_px = _sh["tp_price"]
-                    elif h >= _sh["trail_stop"]:
-                        _sh_outcome = "TRAIL_STOPPED"; _sh_out_px = _sh["trail_stop"]
+                        _sh_outcome = "TP_HIT";   _sh_out_px = _sh["tp_price"]
+                    elif h >= _sh["sl_price"]:
+                        _sh_outcome = "SL_HIT";   _sh_out_px = _sh["sl_price"]
                     elif _sh["candles"] >= 100:
                         _sh_outcome = "EXPIRED"
                     if _sh_outcome:
@@ -917,7 +906,7 @@ class LiveRealTrader:
                                 symbol=self.symbol, interval=self.interval,
                                 blocked_by=_sh["blocked_by"],
                                 entry_price=_sh["entry_price"], tp_price=_sh["tp_price"],
-                                trail_stop_at_resolution=_sh["trail_stop"],
+                                trail_stop_at_resolution=_sh["sl_price"],
                                 band=_sh["band"],
                                 adx_at_entry=_sh.get("adx_at_entry"),
                                 rsi_at_entry=_sh.get("rsi_at_entry"),
@@ -943,9 +932,10 @@ class LiveRealTrader:
             )
 
             # ── DB: signal ──
-            _trail_stop_lvl = None
-            if self.position is not None and self._min_low_since_entry is not None and atr_val > 0:
-                _trail_stop_lvl = self._min_low_since_entry + float(self.exit_params.trail_atr_mult) * atr_val
+            _sl_price_lvl = (
+                self._entry_price * (1.0 + float(self.exit_params.sl_pct))
+                if self.position is not None and self._entry_price is not None else None
+            )
 
             if entry_sig:
                 _sig_type = "ENTRY"
@@ -953,8 +943,8 @@ class LiveRealTrader:
             elif _raw_exit > 0:
                 _sig_type = "EXIT_BAND"
                 _blocked  = None
-            elif _trail_stop_lvl is not None and h >= _trail_stop_lvl:
-                _sig_type = "EXIT_TRAIL"
+            elif _sl_price_lvl is not None and h >= _sl_price_lvl:
+                _sig_type = "EXIT_SL"
                 _blocked  = None
             else:
                 _sig_type = "NONE"
@@ -962,16 +952,16 @@ class LiveRealTrader:
                 if _raw_short > 0 and _final_short == 0:
                     _blocked = "ADX" if adx_val >= 25 else "RSI"
                     # ── Shadow for indicator-blocked signal ───────────────────────
-                    if self.position is None and atr_val > 0 and len(self._shadow_positions) < 5:
-                        _sh_ep  = c
-                        _sh_tp  = _sh_ep * (1.0 - float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
-                        _sh_trl = l + float(self.exit_params.trail_atr_mult) * atr_val
+                    if self.position is None and len(self._shadow_positions) < 5:
+                        _sh_ep = c
+                        _sh_tp = _sh_ep * (1.0 - float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
+                        _sh_sl = _sh_ep * (1.0 + float(self.exit_params.sl_pct))
                         self._shadow_positions.append({
                             "entry_ts": ts_utc, "entry_price": _sh_ep,
-                            "tp_price": _sh_tp, "trail_stop": _sh_trl,
-                            "min_low": l, "band": _raw_short, "blocked_by": _blocked,
+                            "tp_price": _sh_tp, "sl_price": _sh_sl,
+                            "band": _raw_short, "blocked_by": _blocked,
                             "candles": 0, "adx_at_entry": adx_val,
-                            "rsi_at_entry": rsi_val, "atr_at_entry": atr_val,
+                            "rsi_at_entry": rsi_val,
                         })
 
             _db.log_signal(
@@ -979,7 +969,7 @@ class LiveRealTrader:
                 signal_type=_sig_type,
                 raw_band_level=_raw_short, final_band_level=_final_short,
                 adx=adx_val, rsi=rsi_val, atr=atr_val if atr_val else None,
-                trail_stop_level=_trail_stop_lvl,
+                trail_stop_level=_sl_price_lvl,
                 blocked_by=_blocked,
                 o=o, h=h, l=l, c=c,
                 ma_len=self.entry_params.ma_len,
@@ -1001,8 +991,8 @@ class LiveRealTrader:
                     mark_price=self.mark_price,
                     liquidation_price=self.position.liq_price,
                     unrealized_pnl=_upnl,
-                    min_low_since_entry=self._min_low_since_entry,
-                    trail_stop_price=_trail_stop_lvl,
+                    min_low_since_entry=None,
+                    trail_stop_price=_sl_price_lvl,
                     tp_price=_tp_snap,
                     wallet=self.wallet,
                 )
@@ -1015,10 +1005,6 @@ class LiveRealTrader:
                     min_low_since_entry=None, trail_stop_price=None,
                     tp_price=None, wallet=self.wallet,
                 )
-
-            # ── Update Jason McIntosh trail stop tracking ──
-            if self.position is not None and self._min_low_since_entry is not None:
-                self._min_low_since_entry = min(self._min_low_since_entry, l)
 
             # ── Time-based TP tightening (20h after entry → data-driven tighter TP) ──
             if (self.position is not None
@@ -1060,23 +1046,21 @@ class LiveRealTrader:
                 except Exception as _ttp_err:
                     log.warning(f"[{ts_utc}] Time-based TP update failed: {_ttp_err}")
 
-            # ── Jason McIntosh trail stop signal ──
-            trail_stop_exit = False
-            if self.position is not None and self._min_low_since_entry is not None:
-                trail_atr_val = float(row["atr"]) if "atr" in self.df.columns and not pd.isna(row["atr"]) else 0.0
-                if trail_atr_val > 0:
-                    trail_stop_lvl = self._min_low_since_entry + float(self.exit_params.trail_atr_mult) * trail_atr_val
-                    if h >= trail_stop_lvl:
-                        trail_stop_exit = True
+            # ── Hard stop-loss signal ──
+            sl_exit = False
+            if self.position is not None and self._entry_price is not None:
+                sl_price = self._entry_price * (1.0 + float(self.exit_params.sl_pct))
+                if h >= sl_price:
+                    sl_exit = True
 
             if entry_sig:
                 self.last_signal = {"type": "ENTRY", "time": ts_utc, "placed": False, "filled": False, "price": None, "band": _raw_short}
-            elif exit_sig or trail_stop_exit:
+            elif exit_sig or sl_exit:
                 self.last_signal = {"type": "EXIT",  "time": ts_utc, "placed": False, "filled": False, "price": None, "band": _raw_short}
 
-            # ── Jason McIntosh trail stop exit ──  (priority 3, matches backtester)
-            if not acted and trail_stop_exit and self.position is not None:
-                self._execute_exit(c, "TRAIL_STOP", ts_utc)
+            # ── Stop-loss exit ──  (priority 3, matches backtester)
+            if not acted and sl_exit and self.position is not None:
+                self._execute_exit(c, "STOP_LOSS", ts_utc)
                 acted = True
 
             # ── Band exit ──  (priority 4, only if no other action this candle)
@@ -1088,36 +1072,33 @@ class LiveRealTrader:
             if not acted and entry_sig and self.position is None and not self._halted:
                 if self.wallet >= MIN_WALLET_USDT:
                     self._execute_entry(c, ts_utc, ts)
-                    # Initialise trail stop tracking with this bar's low if entry filled
-                    if self.position is not None and self._min_low_since_entry is None:
-                        self._min_low_since_entry = l
                 else:
                     log.warning(f"[{ts_utc}] Entry signal — wallet {self.wallet:.4f} < {MIN_WALLET_USDT}")
                     # ── Shadow for wallet-blocked signal ─────────────────────────
-                    if atr_val > 0 and len(self._shadow_positions) < 5:
-                        _sh_ep  = c
-                        _sh_tp  = _sh_ep * (1.0 - float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
-                        _sh_trl = l + float(self.exit_params.trail_atr_mult) * atr_val
+                    if len(self._shadow_positions) < 5:
+                        _sh_ep = c
+                        _sh_tp = _sh_ep * (1.0 - float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
+                        _sh_sl = _sh_ep * (1.0 + float(self.exit_params.sl_pct))
                         self._shadow_positions.append({
                             "entry_ts": ts_utc, "entry_price": _sh_ep,
-                            "tp_price": _sh_tp, "trail_stop": _sh_trl,
-                            "min_low": l, "band": _raw_short, "blocked_by": "WALLET",
+                            "tp_price": _sh_tp, "sl_price": _sh_sl,
+                            "band": _raw_short, "blocked_by": "WALLET",
                             "candles": 0, "adx_at_entry": adx_val,
-                            "rsi_at_entry": rsi_val, "atr_at_entry": atr_val,
+                            "rsi_at_entry": rsi_val,
                         })
             elif entry_sig and self.position is not None:
                 log.info(f"[{ts_utc}] Entry signal — already SHORT (no pyramiding)")
                 # ── Shadow for position-blocked signal ───────────────────────────
-                if atr_val > 0 and len(self._shadow_positions) < 5:
-                    _sh_ep  = c
-                    _sh_tp  = _sh_ep * (1.0 - float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
-                    _sh_trl = l + float(self.exit_params.trail_atr_mult) * atr_val
+                if len(self._shadow_positions) < 5:
+                    _sh_ep = c
+                    _sh_tp = _sh_ep * (1.0 - float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
+                    _sh_sl = _sh_ep * (1.0 + float(self.exit_params.sl_pct))
                     self._shadow_positions.append({
                         "entry_ts": ts_utc, "entry_price": _sh_ep,
-                        "tp_price": _sh_tp, "trail_stop": _sh_trl,
-                        "min_low": l, "band": _raw_short, "blocked_by": "POSITION",
+                        "tp_price": _sh_tp, "sl_price": _sh_sl,
+                        "band": _raw_short, "blocked_by": "POSITION",
                         "candles": 0, "adx_at_entry": adx_val,
-                        "rsi_at_entry": rsi_val, "atr_at_entry": atr_val,
+                        "rsi_at_entry": rsi_val,
                     })
 
             # ── Display ──
