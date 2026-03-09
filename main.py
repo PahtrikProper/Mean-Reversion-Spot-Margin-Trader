@@ -300,9 +300,14 @@ def run_live_trading():
             interval      = data["interval"],
         )
         traders[sym] = trader
+        trader._traders_ref = traders  # enables interval-switching during re-opt
 
     print(f"\n  {len(traders)} trader(s) ready.  Starting WebSocket...\n")
-    bot_module.start_live_ws(traders)
+    bot_module.start_live_ws(
+        traders,
+        all_symbols=list(const_module.SYMBOLS),
+        all_intervals=list(const_module.CANDLE_INTERVALS),
+    )
     print("\n  Live trading stopped.")
 
 
@@ -477,9 +482,14 @@ def run_paper_trading():
             instrument   = data["instrument"],
         )
         traders[sym] = trader
+        trader._traders_ref = traders  # enables symbol/interval-switching during re-opt
 
     print(f"\n  {len(traders)} paper trader(s) ready.  Starting WebSocket...\n")
-    bot_module.start_live_ws(traders)
+    bot_module.start_live_ws(
+        traders,
+        all_symbols=list(const_module.PAPER_SYMBOLS),
+        all_intervals=list(const_module.CANDLE_INTERVALS),
+    )
     print("\n  Paper trading stopped.")
 
 

@@ -34,12 +34,14 @@ from ..utils.constants import (
     COLOR_SUBMITTED,
     SIGNAL_DROUGHT_HOURS,
     MAX_LOSS_PCT,
+    PAPER_SYMBOLS,
+    CANDLE_INTERVALS,
 )
 from ..utils.data_structures import RealPosition, EntryParams, ExitParams, MC_MIN_TRADES, MC_SIMS
 from ..utils.position_gate import PositionGate
 from ..utils.logger import log_order
 from ..utils import db_logger as _db
-from ..utils.helpers import now_ms, interval_minutes, leverage_for, taker_fee_for, maker_fee_for
+from ..utils.helpers import now_ms, interval_minutes, leverage_for, taker_fee_for, maker_fee_for, supported_intervals
 from ..utils.trading_status import get_status_monitor
 from ..core.indicators import (
     build_indicators,
@@ -50,7 +52,7 @@ from ..core.indicators import (
     RSI_NEUTRAL_LO,
 )
 from ..core.orders import apply_slippage
-from ..trading.bybit_client import fetch_last_klines, fetch_mark_klines
+from ..trading.bybit_client import fetch_last_klines, fetch_mark_klines, fetch_risk_tiers, get_instrument_info
 from ..trading.liquidation import pick_risk_tier, liquidation_price_short_isolated
 from ..backtest.backtester import run_monte_carlo, mc_score
 from ..utils.plotting import print_monte_carlo_report
@@ -127,6 +129,7 @@ class PaperTrader:
         self._halt_ts: Optional[float] = None           # timestamp when halt started
         self._last_drought_log: float  = 0.0            # cooldown for drought events
         self._shadow_positions: list   = []             # virtual "what if" trades for gate-blocked signals
+        self._traders_ref: Optional[Dict] = None        # set by caller; used for symbol-switching at re-opt
 
         if len(df_mark_seed) == 0:
             raise RuntimeError("No mark seed data")
@@ -525,54 +528,101 @@ class PaperTrader:
         ).start()
 
     def _run_reoptimise(self):
-        """Background thread: re-run param search using public API data."""
-        log.info(f"[PAPER][REOPT] {self.symbol}: re-running optimisation...")
+        """Background thread: re-run param search across ALL PAPER_SYMBOLS × CANDLE_INTERVALS.
+
+        Selects the globally best (symbol, interval, params) by score = PnL% / (1 + DD%).
+        Switches this trader to the winner if a different pair scores better and MC score > 0.
+        """
+        log.info("[PAPER][REOPT] starting multi-pair optimisation ...")
         try:
-            df_last, df_mark = _download_seed(self.symbol, DAYS_BACK_SEED, self.interval)
-            lev       = leverage_for(self.symbol)
-            fee       = taker_fee_for(self.symbol)
-            maker_fee = maker_fee_for(self.symbol)
+            best_score   = float("-inf")
+            best_sym     = self.symbol
+            best_iv      = self.interval
+            best_entry   = None
+            best_exit_p  = None
+            best_br      = None
+            best_df_last = None
+            best_risk_df = None
+            best_inst    = None
 
-            saved_best = {
-                "ma_len":         self.entry_params.ma_len,
-                "band_mult":      self.entry_params.band_mult,
-                "tp_pct":         self.exit_params.tp_pct,
-                "sl_pct":         self.exit_params.sl_pct,
-                "exit_ma_len":    self.exit_params.exit_ma_len,
-                "exit_band_mult": self.exit_params.exit_band_mult,
-            }
+            for sym in PAPER_SYMBOLS:
+                try:
+                    risk_df = fetch_risk_tiers(sym)
+                    inst    = get_instrument_info(sym)
+                except Exception as e:
+                    log.warning(f"[PAPER][REOPT] {sym}: fetch_risk_tiers failed: {e}")
+                    continue
 
-            opt = optimise_params(
-                df_last=df_last, df_mark=df_mark,
-                risk_df=self.risk_df,
-                trials=INIT_TRIALS,
-                lookback_candles=min(len(df_last), len(df_mark)),
-                event_name=f"PAPER_REOPT_{self.symbol}_{self.interval}m",
-                leverage=lev, fee_rate=fee, maker_fee_rate=maker_fee,
-                interval_minutes=interval_minutes(self.interval),
-                saved_best=saved_best,
-                db_symbol=self.symbol, db_interval=self.interval, db_trigger="REOPT",
-            )
+                for iv in supported_intervals(CANDLE_INTERVALS):
+                    try:
+                        df_last, df_mark = _download_seed(sym, DAYS_BACK_SEED, iv)
 
-            new_entry  = opt["entry_params"]
-            new_exit   = opt["exit_params"]
-            new_result = opt["best_result"]
+                        saved_best = None
+                        if sym == self.symbol and iv == self.interval:
+                            saved_best = {
+                                "ma_len":         self.entry_params.ma_len,
+                                "band_mult":      self.entry_params.band_mult,
+                                "tp_pct":         self.exit_params.tp_pct,
+                                "sl_pct":         self.exit_params.sl_pct,
+                                "exit_ma_len":    self.exit_params.exit_ma_len,
+                                "exit_band_mult": self.exit_params.exit_band_mult,
+                            }
 
-            records      = getattr(new_result, "trade_records", []) or []
+                        opt = optimise_params(
+                            df_last=df_last, df_mark=df_mark,
+                            risk_df=risk_df,
+                            trials=INIT_TRIALS,
+                            lookback_candles=min(len(df_last), len(df_mark)),
+                            event_name=f"PAPER_REOPT_{sym}_{iv}m",
+                            leverage=leverage_for(sym),
+                            fee_rate=taker_fee_for(sym),
+                            maker_fee_rate=maker_fee_for(sym),
+                            interval_minutes=interval_minutes(iv),
+                            saved_best=saved_best,
+                            db_symbol=sym, db_interval=iv, db_trigger="REOPT",
+                        )
+
+                        br = opt["best_result"]
+                        pf = br.pnl_pct / (1.0 + max(br.max_drawdown_pct, 0.001))
+                        log.info(
+                            f"[PAPER][REOPT] {sym} {iv}m  score={pf:.4f}  "
+                            f"PnL={br.pnl_pct:.2f}%  DD={br.max_drawdown_pct:.1f}%"
+                        )
+
+                        if pf > best_score:
+                            best_score   = pf
+                            best_sym     = sym
+                            best_iv      = iv
+                            best_entry   = opt["entry_params"]
+                            best_exit_p  = opt["exit_params"]
+                            best_br      = br
+                            best_df_last = df_last
+                            best_risk_df = risk_df
+                            best_inst    = inst
+
+                    except Exception as e:
+                        log.warning(f"[PAPER][REOPT] {sym} {iv}m: skipped: {e}")
+
+            if best_entry is None:
+                log.warning("[PAPER][REOPT] No valid pairs found — keeping old params")
+                return
+
+            # ── Monte Carlo on the globally best result ────────────────────────
+            records      = getattr(best_br, "trade_records", []) or []
             new_mc_score = float("-inf")
+            mc_res       = None
             if len(records) >= MC_MIN_TRADES:
                 mc_res = run_monte_carlo(records, float(PAPER_STARTING_BALANCE), n_sims=MC_SIMS)
                 if mc_res:
                     new_mc_score = mc_score(mc_res)
                     print_monte_carlo_report(
                         mc_res, float(PAPER_STARTING_BALANCE),
-                        len(records), self.symbol, self.interval
+                        len(records), best_sym, best_iv,
                     )
 
             log.info(
-                f"[PAPER][REOPT] {self.symbol}: MC score={new_mc_score:.4f} | "
-                f"MA-len={new_entry.ma_len}  BandMult={new_entry.band_mult:.2f}%  "
-                f"TP={new_exit.tp_pct*100:.2f}%"
+                f"[PAPER][REOPT] winner={best_sym} {best_iv}m  MC={new_mc_score:.4f}  "
+                f"(current={self.symbol} {self.interval}m)"
             )
 
             _ts_reopt = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
@@ -580,37 +630,67 @@ class PaperTrader:
             # DB: MC run
             if mc_res:
                 _db.log_monte_carlo(
-                    ts_utc=_ts_reopt, symbol=self.symbol, interval=self.interval,
-                    mc_results=mc_res, score=new_mc_score if new_mc_score != float("-inf") else None,
+                    ts_utc=_ts_reopt, symbol=best_sym, interval=best_iv,
+                    mc_results=mc_res,
+                    score=new_mc_score if new_mc_score != float("-inf") else None,
                 )
 
             # DB: params event
             _event = "REOPT_ACCEPTED" if new_mc_score > 0 else "REOPT_REJECTED"
             _db.log_params(
-                ts_utc=_ts_reopt, symbol=self.symbol, interval=self.interval,
+                ts_utc=_ts_reopt, symbol=best_sym, interval=best_iv,
                 event=_event,
-                ma_len=new_entry.ma_len, band_mult=new_entry.band_mult, tp_pct=new_exit.tp_pct,
+                ma_len=best_entry.ma_len, band_mult=best_entry.band_mult,
+                tp_pct=best_exit_p.tp_pct,
                 mc_score=new_mc_score if new_mc_score != float("-inf") else None,
-                sharpe=new_result.sharpe_ratio,
-                pnl_pct=new_result.pnl_pct,
-                max_drawdown_pct=new_result.max_drawdown_pct,
-                trade_count=new_result.trades,
-                winrate=new_result.winrate,
+                sharpe=best_br.sharpe_ratio, pnl_pct=best_br.pnl_pct,
+                max_drawdown_pct=best_br.max_drawdown_pct,
+                trade_count=best_br.trades, winrate=best_br.winrate,
                 wallet=self.wallet,
             )
 
             if new_mc_score > 0:
-                self.entry_params = new_entry
-                self.exit_params  = new_exit
-                log.info(f"[PAPER][REOPT] {self.symbol}: params updated (MC score={new_mc_score:.4f})")
+                _switched = (best_sym != self.symbol or best_iv != self.interval)
+
+                if _switched:
+                    log.info(
+                        f"[PAPER][REOPT] ★ switching {self.symbol} {self.interval}m "
+                        f"→ {best_sym} {best_iv}m  (score {best_score:.4f})"
+                    )
+                    if self._traders_ref is not None:
+                        self._traders_ref.pop(self.symbol, None)
+                        self._traders_ref[best_sym] = self
+
+                    self.symbol     = best_sym
+                    self.interval   = best_iv
+                    self.risk_df    = best_risk_df
+                    self.instrument = best_inst
+                    self.leverage   = leverage_for(best_sym)
+                    self.taker_fee  = taker_fee_for(best_sym)
+                    self.df = best_df_last[
+                        ["ts", "open", "high", "low", "close", "volume"]
+                    ].copy().reset_index(drop=True)
+                    self.closed_candle_count = 0
+                    self._last_signal_ts     = time.time()
+                    self._shadow_positions   = []
+
+                self.entry_params = best_entry
+                self.exit_params  = best_exit_p
+                self._recompute_indicators()
+                log.info(
+                    f"[PAPER][REOPT] {'switched + ' if _switched else ''}params updated "
+                    f"(MC={new_mc_score:.4f})"
+                )
             else:
-                log.info(f"[PAPER][REOPT] {self.symbol}: MC score {new_mc_score:.4f} <= 0 — keeping old params")
+                log.info(
+                    f"[PAPER][REOPT] MC score {new_mc_score:.4f} <= 0 — keeping old params"
+                )
 
         except Exception as e:
-            log.error(f"[PAPER][REOPT] {self.symbol}: failed: {e}")
+            log.error(f"[PAPER][REOPT] failed: {e}", exc_info=True)
         finally:
             self.last_reopt_time = time.time()
-            self._reopt_running = False
+            self._reopt_running  = False
 
     # ── Main candle callback ───────────────────────────────────────────────────
 
