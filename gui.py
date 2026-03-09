@@ -1529,6 +1529,18 @@ class App(ctk.CTk):
             C.API_KEY    = k
             C.API_SECRET = s
 
+        # ── Schema compliance check ────────────────────────────────────────────
+        # Silently resets the database if the on-disk schema is out of date
+        # (e.g. after a code upgrade that added new columns).
+        from engine.utils.db_logger import validate_or_reset_db
+        was_reset = validate_or_reset_db(C.DB_PATH)
+        if not was_reset:
+            messagebox.showinfo(
+                "Database Reset",
+                "The trading database was out of date and has been reset.\n"
+                "A fresh database has been created — previous session data is no longer available.",
+            )
+
         self._btn_start.configure(state="disabled")
         self._btn_stop.configure(state="normal")
         self._mode_seg.configure(state="disabled")

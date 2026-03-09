@@ -57,6 +57,77 @@ def init_db(path: str) -> None:
     log.info(f"[DB] Opened database: {path}")
 
 
+def validate_or_reset_db(db_path: str) -> bool:
+    """Check the on-disk schema against the current code expectations.
+
+    If any table is missing columns introduced by recent upgrades, the
+    database is closed, deleted, and re-initialised so the correct schema
+    is applied from scratch.  Existing data is lost, but a stale schema
+    causes silent data-loss anyway.
+
+    Call this from the GUI Start button *before* launching any threads.
+
+    Returns
+    -------
+    True  — schema was already current (or file didn't exist yet)
+    False — schema was stale; DB was deleted and recreated
+    """
+    global _conn
+    import os
+
+    if not os.path.exists(db_path):
+        return True  # no file yet — will be created fresh on next init_db()
+
+    # Minimum expected total-column count per table (PRAGMA table_info returns
+    # one row per column, including the autoincrement id).  Raise these numbers
+    # whenever new columns are added to keep the check current.
+    _EXPECTED_MIN: dict = {
+        "candle_analytics": 56,   # id + 52 base + exit_ma_len + exit_band_mult + sl_pct
+    }
+
+    stale = False
+    try:
+        tmp = sqlite3.connect(db_path, check_same_thread=False)
+        try:
+            for table, min_cols in _EXPECTED_MIN.items():
+                cur  = tmp.execute(f"PRAGMA table_info({table})")
+                rows = cur.fetchall()
+                if len(rows) < min_cols:
+                    log.info(
+                        f"[DB] Schema mismatch: '{table}' has {len(rows)} columns "
+                        f"(need >= {min_cols}) — database will be reset"
+                    )
+                    stale = True
+                    break
+        finally:
+            tmp.close()
+    except Exception as exc:
+        log.warning(f"[DB] Schema check failed ({exc}) — resetting database")
+        stale = True
+
+    if not stale:
+        return True
+
+    # ── Nuke the stale DB and start fresh ─────────────────────────────────────
+    with _lock:
+        if _conn is not None:
+            try:
+                _conn.close()
+            except Exception:
+                pass
+            _conn = None
+
+    try:
+        os.remove(db_path)
+        log.info(f"[DB] Stale database removed: {db_path}")
+    except Exception as exc:
+        log.warning(f"[DB] Could not remove stale database: {exc}")
+
+    init_db(db_path)
+    log.info(f"[DB] Fresh database initialised: {db_path}")
+    return False
+
+
 def _execute(sql: str, params: tuple = ()) -> None:
     """Execute a single statement inside the global lock.
 
@@ -147,7 +218,10 @@ def _create_tables() -> None:
         basis_pct            REAL,  -- (close - mark) / mark * 100
         -- Strategy params in effect
         ma_len               INTEGER,
-        band_mult            REAL
+        band_mult            REAL,
+        exit_ma_len          INTEGER,  -- exit-band MA length (independent from entry)
+        exit_band_mult       REAL,     -- exit-band multiplier
+        sl_pct               REAL      -- hard stop-loss % in effect
     );
 
     -- ── Signals ──────────────────────────────────────────────────────────────
@@ -429,6 +503,9 @@ def log_candle_analytics(
     mark_price: float,
     ma_len: int,
     band_mult: float,
+    exit_ma_len: int = 0,
+    exit_band_mult: float = 0.0,
+    sl_pct: float = 0.0,
 ) -> None:
     """Compute and log all candle analytics from the indicator DataFrame."""
     if df is None or len(df) < 2:
@@ -537,13 +614,14 @@ def log_candle_analytics(
             dist_to_discount_5, dist_to_discount_6, dist_to_discount_7, dist_to_discount_8,
             hv_20, volume, volume_ratio,
             mark_price, basis_pct,
-            ma_len, band_mult
+            ma_len, band_mult,
+            exit_ma_len, exit_band_mult, sl_pct
         ) VALUES (
             ?,?,?,?,?,?,?,?,?,?,?,?,
             ?,?,?,?,?,?,?,?,
             ?,?,?,?,?,?,?,?,
             ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-            ?,?,?,?,?,?,?
+            ?,?,?,?,?,?,?,?,?,?
         )""",
         (
             ts_utc, symbol, interval,
@@ -557,6 +635,7 @@ def log_candle_analytics(
             hv_20, vol, vol_ratio,
             mp, basis_pct,
             ma_len, band_mult,
+            exit_ma_len, exit_band_mult, sl_pct,
         ),
     )
 

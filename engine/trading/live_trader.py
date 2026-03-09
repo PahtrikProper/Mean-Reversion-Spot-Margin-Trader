@@ -985,6 +985,9 @@ class LiveRealTrader:
                 ts_utc=ts_utc, symbol=self.symbol, interval=self.interval,
                 df=self.df, mark_price=self.mark_price,
                 ma_len=self.entry_params.ma_len, band_mult=self.entry_params.band_mult,
+                exit_ma_len=self.exit_params.exit_ma_len,
+                exit_band_mult=float(self.exit_params.exit_band_mult),
+                sl_pct=float(self.exit_params.sl_pct),
             )
 
             # ── DB: signal ──
