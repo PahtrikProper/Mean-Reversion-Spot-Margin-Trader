@@ -35,11 +35,10 @@ SLIPPAGE_TICKS = 1
 TICK_SIZE      = 0.0001      # for slippage simulation
 
 # ── Live TP scaling ───────────────────────────────────────────────────────────
-# The optimiser finds a tp_pct on historical data.  In live trading the
-# server-side TP (and all displays) uses this fraction of that value so the
-# order sits closer to the fill price and is more likely to trigger.
-# 0.75 → live TP distance = 75% of the back-tested distance.
-LIVE_TP_SCALE = 0.75
+# 1.0 = live TP matches backtested TP exactly (entry * (1 - tp_pct)).
+# Do NOT apply leverage here — tp_pct is a raw price-move fraction, not a
+# leveraged return.
+LIVE_TP_SCALE = 1.0
 
 # ── Time-based TP tightening ─────────────────────────────────────────────────
 # If a position is still open after TIME_TP_HOURS, the TP is overridden with a

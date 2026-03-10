@@ -328,7 +328,7 @@ class LiveRealTrader:
             log.info(
                 f"{COLOR_SUBMITTED}[{ts_utc}] SHORT ENTRY FILLED: "
                 f"qty={filled_qty:.6f} fill={fill_price:.8f} "
-                f"TP={tp_price} ({self.exit_params.tp_pct*100:.2f}%){COLOR_RESET}"
+                f"TP={tp_price} ({(1.0 - tp_price/fill_price)*100:.2f}%){COLOR_RESET}"
             )
             log_order(ts_utc=ts_utc, symbol=self.symbol, side="SHORT",
                       qty=filled_qty, price=fill_price,
