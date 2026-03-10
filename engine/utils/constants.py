@@ -54,7 +54,7 @@ DEFAULT_MA_LEN         = 100    # RMA period for entry (premium) band centre lin
 DEFAULT_BAND_MULT      = 2.5    # Entry band width multiplier (%)
 DEFAULT_EXIT_MA_LEN    = 100    # RMA period for exit (discount) band centre line
 DEFAULT_EXIT_BAND_MULT = 2.5    # Exit band width multiplier (%)
-DEFAULT_TP_PCT         = 0.0028 # 0.28% take-profit (optimised; ~midpoint of range)
+DEFAULT_TP_PCT         = 0.003  # 0.30% take-profit (fixed — not optimised)
 
 # ── Hard stop-loss (SHORT exit) ───────────────────────────────────────────────
 # Fires when: current_high >= entry_price * (1 + sl_pct)
