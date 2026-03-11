@@ -1033,7 +1033,7 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=13), text_color="#c9d1d9",
         ).grid(row=5, column=0, padx=(14, 8), pady=(0, 12), sticky="w")
 
-        _tp_options = ["0.2%", "0.3%", "0.4%", "0.5%"]
+        _tp_options = ["0.2%", "0.3%", "0.4%", "0.5%", "1.0%", "2.0%", "3.0%", "4.0%", "5.0%", "6.0%"]
         _tp_default = f"{C.DEFAULT_TP_PCT * 100:.1f}%"
         if _tp_default not in _tp_options:
             _tp_default = "0.3%"
@@ -1543,7 +1543,7 @@ class App(ctk.CTk):
             pct = float(raw)
         except ValueError:
             return
-        pct = round(max(0.1, min(5.0, pct)), 4)
+        pct = round(max(0.1, min(6.0, pct)), 4)
         C.DEFAULT_TP_PCT = pct / 100.0
         self._lbl_tp_status.configure(
             text=f"Current: {pct:.1f}%  (applied before analysis starts)",
