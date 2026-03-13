@@ -322,7 +322,13 @@ def _create_tables() -> None:
         event            TEXT,   -- 'STARTUP','REOPT_ACCEPTED','REOPT_REJECTED'
         ma_len           INTEGER,
         band_mult        REAL,
+        adx_threshold    REAL,
+        rsi_neutral_lo   REAL,
+        band_ema_len     INTEGER,
         tp_pct           REAL,
+        sl_pct           REAL,
+        exit_ma_len      INTEGER,
+        exit_band_mult   REAL,
         mc_score         REAL,
         sharpe           REAL,
         pnl_pct          REAL,
@@ -457,6 +463,22 @@ def _create_tables() -> None:
     CREATE INDEX IF NOT EXISTS idx_mp_ticks_sym     ON mark_price_ticks  (symbol, ts_utc);
     CREATE INDEX IF NOT EXISTS idx_missed_sym       ON missed_trades     (symbol, entry_ts);
     """)
+
+    # ── Migrate existing params table — add columns silently if missing ────────
+    _params_new_cols = [
+        ("adx_threshold",  "REAL"),
+        ("rsi_neutral_lo", "REAL"),
+        ("band_ema_len",   "INTEGER"),
+        ("sl_pct",         "REAL"),
+        ("exit_ma_len",    "INTEGER"),
+        ("exit_band_mult", "REAL"),
+    ]
+    for _col, _typ in _params_new_cols:
+        try:
+            _conn.execute(f"ALTER TABLE params ADD COLUMN {_col} {_typ}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    _conn.commit()
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -798,17 +820,26 @@ def log_params(
     trade_count: Optional[int] = None,
     winrate: Optional[float] = None,
     wallet: Optional[float] = None,
+    adx_threshold: Optional[float] = None,
+    rsi_neutral_lo: Optional[float] = None,
+    band_ema_len: Optional[int] = None,
+    sl_pct: Optional[float] = None,
+    exit_ma_len: Optional[int] = None,
+    exit_band_mult: Optional[float] = None,
 ) -> None:
     _execute(
         """INSERT INTO params (
             ts_utc, symbol, interval, event,
-            ma_len, band_mult, tp_pct,
+            ma_len, band_mult, adx_threshold, rsi_neutral_lo, band_ema_len,
+            tp_pct, sl_pct, exit_ma_len, exit_band_mult,
             mc_score, sharpe, pnl_pct, max_drawdown_pct,
             trade_count, winrate, wallet
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             ts_utc, symbol, interval, event,
-            ma_len, _safe(band_mult), _safe(tp_pct),
+            ma_len, _safe(band_mult),
+            _safe(adx_threshold), _safe(rsi_neutral_lo), band_ema_len,
+            _safe(tp_pct), _safe(sl_pct), exit_ma_len, _safe(exit_band_mult),
             _safe(mc_score), _safe(sharpe), _safe(pnl_pct), _safe(max_drawdown_pct),
             trade_count, _safe(winrate), _safe(wallet),
         ),

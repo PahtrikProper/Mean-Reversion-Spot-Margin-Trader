@@ -54,7 +54,12 @@ DEFAULT_MA_LEN         = 100    # RMA period for entry (premium) band centre lin
 DEFAULT_BAND_MULT      = 2.5    # Entry band width multiplier (%)
 DEFAULT_EXIT_MA_LEN    = 100    # RMA period for exit (discount) band centre line
 DEFAULT_EXIT_BAND_MULT = 2.5    # Exit band width multiplier (%)
-DEFAULT_TP_PCT         = 0.003  # 0.30% take-profit (fixed — not optimised)
+DEFAULT_TP_PCT         = 0.003  # 0.30% take-profit (default; now also optimised)
+
+# ── Entry gate defaults (also optimised at runtime) ───────────────────────────
+ADX_THRESHOLD   = 25.0  # ADX must be below this for entry (range-bound regime)
+RSI_NEUTRAL_LO  = 50.0  # RSI must be >= this at candle close (overbought confirmation)
+BAND_EMA_LENGTH = 5     # EMA smoothing period applied to all 8 premium/discount bands
 
 # ── Hard stop-loss (SHORT exit) ───────────────────────────────────────────────
 # Fires when: current_high >= entry_price * (1 + sl_pct)
@@ -84,14 +89,29 @@ OPT_EXIT_MA_LEN_MAX        = 300
 OPT_EXIT_BAND_MULT_X10_MIN = 3    # 0.3%
 OPT_EXIT_BAND_MULT_X10_MAX = 100  # 10.0%
 
-# Take-profit (in basis points, 1 bp = 0.0001; 18 = 0.18%, 1100 = 11.00%)
-OPT_TP_MIN_BP       = 18    # 0.18% price move before leverage
-OPT_TP_MAX_BP       = 1100  # 11.00% price move before leverage
+# Take-profit (in basis points, 1 bp = 0.0001; 20 = 0.20%, 100 = 1.00%)
+# Data-driven range: ATR% medians are 0.19–0.41% across intervals → 20–100 bp
+OPT_TP_MIN_BP       = 20    # 0.20% price move (1× ATR on 3-min)
+OPT_TP_MAX_BP       = 100   # 1.00% price move (2.5× ATR on 15-min)
 
 # Stop-loss (in basis points; 50 = 0.50%, 900 = 9.00%)
 # Upper bound kept below liquidation threshold (~10% for 10× leverage).
 OPT_SL_MIN_BP       = 50    # 0.50% above entry
 OPT_SL_MAX_BP       = 900   # 9.00% above entry
+
+# ADX gate threshold (integer; 20 = most permissive, 28 = strictest in tested range)
+# Data-driven: 3-min p50=25.13, 5-min p50=20.51, 15-min p50=23.33
+OPT_ADX_MIN         = 20
+OPT_ADX_MAX         = 28
+
+# RSI neutral-low threshold (integer; 40 = most permissive, 60 = strictest)
+# Data-driven: RSI p25=41, p75=60 across all intervals
+OPT_RSI_LO_MIN      = 40
+OPT_RSI_LO_MAX      = 60
+
+# Band EMA smoothing length (integer; 2 = most responsive, 15 = smoothest)
+OPT_BAND_EMA_MIN    = 2
+OPT_BAND_EMA_MAX    = 15
 
 OPT_N_RANDOM      = INIT_TRIALS
 OPT_MIN_TRADES    = 1
@@ -102,10 +122,13 @@ RANDOM_SEED       = None     # set int for reproducible runs
 EXPLOIT_RATIO                     = 0.60
 EXPLOIT_MA_LEN_RADIUS             = 15
 EXPLOIT_BAND_MULT_RADIUS_X10      = 3    # ±0.3 around saved best entry band_mult
-EXPLOIT_TP_RADIUS_BP              = 50   # ±0.50% around saved best TP
+EXPLOIT_TP_RADIUS_BP              = 15   # ±0.15% around saved best TP (range is 0.20–1.00%)
 EXPLOIT_SL_RADIUS_BP              = 50   # ±0.50% around saved best SL
 EXPLOIT_EXIT_MA_LEN_RADIUS        = 15
 EXPLOIT_EXIT_BAND_MULT_RADIUS_X10 = 3    # ±0.3 around saved best exit band_mult
+EXPLOIT_ADX_RADIUS                = 2    # ±2 around saved best ADX threshold
+EXPLOIT_RSI_LO_RADIUS             = 5    # ±5 around saved best RSI neutral-low
+EXPLOIT_BAND_EMA_RADIUS           = 2    # ±2 around saved best band EMA length
 
 # ── Runtime behaviour ─────────────────────────────────────────────────────────
 KEEP_CANDLES            = 3000

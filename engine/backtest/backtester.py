@@ -110,6 +110,7 @@ def backtest_once(
         band_mult=entry_params.band_mult,
         exit_ma_len=exit_params.exit_ma_len,
         exit_band_mult=exit_params.exit_band_mult,
+        band_ema_len=entry_params.band_ema_len,
     )
 
     # ── Backtest loop ─────────────────────────────────────────────────────────
@@ -255,7 +256,11 @@ def backtest_once(
                 current_high=high_last, current_low=low_last,
             )
             _rsi_val = float(row["rsi"]) if not pd.isna(row["rsi"]) else 100.0
-            if resolve_entry_signals(_raw_short, float(row["adx"]), _rsi_val) > 0:
+            if resolve_entry_signals(
+                _raw_short, float(row["adx"]), _rsi_val,
+                adx_threshold=entry_params.adx_threshold,
+                rsi_neutral_lo=entry_params.rsi_neutral_lo,
+            ) > 0:
                 fill            = _apply_slippage(close, "sell")
                 wallet_at_entry = wallet
                 notional        = wallet * leverage

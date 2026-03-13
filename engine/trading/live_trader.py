@@ -54,8 +54,6 @@ from ..core.indicators import (
     compute_entry_signals_raw,
     resolve_entry_signals,
     compute_exit_signals_raw,
-    ADX_THRESHOLD,
-    RSI_NEUTRAL_LO,
 )
 from ..trading.bybit_client import BybitPrivateClient, fetch_last_klines, fetch_mark_klines, fetch_risk_tiers, get_instrument_info
 from ..trading.liquidation import pick_risk_tier
@@ -150,6 +148,7 @@ class LiveRealTrader:
             band_mult=self.entry_params.band_mult,
             exit_ma_len=self.exit_params.exit_ma_len,
             exit_band_mult=self.exit_params.exit_band_mult,
+            band_ema_len=self.entry_params.band_ema_len,
         )
 
     # ── Order helpers ─────────────────────────────────────────────────────────
@@ -612,7 +611,8 @@ class LiveRealTrader:
         log.info(
             f"[{ts_utc}]  {self.symbol} #{self.closed_candle_count} {self.interval}m  "
             f"C={c:.5f}  |  "
-            f"ADX={adx:.1f}(<{ADX_THRESHOLD:.0f})  RSI={rsi:.1f}(>={RSI_NEUTRAL_LO:.0f})  "
+            f"ADX={adx:.1f}(<{self.entry_params.adx_threshold:.0f})  "
+            f"RSI={rsi:.1f}(>={self.entry_params.rsi_neutral_lo:.0f})  "
             f"TP={xp.tp_pct*100:.3f}%  |  "
             f"{sig_col}{sig_str}{COLOR_RESET}  |  "
             f"W={self.win_count} L={self.trade_count - self.win_count} WR={wr:.0f}%  "
@@ -697,12 +697,15 @@ class LiveRealTrader:
                         saved_best = None
                         if sym == self.symbol and iv == self.interval:
                             saved_best = {
-                                "ma_len":         self.entry_params.ma_len,
-                                "band_mult":      self.entry_params.band_mult,
-                                "tp_pct":         self.exit_params.tp_pct,
-                                "sl_pct":         self.exit_params.sl_pct,
-                                "exit_ma_len":    self.exit_params.exit_ma_len,
-                                "exit_band_mult": self.exit_params.exit_band_mult,
+                                "ma_len":          self.entry_params.ma_len,
+                                "band_mult":       self.entry_params.band_mult,
+                                "adx_threshold":   self.entry_params.adx_threshold,
+                                "rsi_neutral_lo":  self.entry_params.rsi_neutral_lo,
+                                "band_ema_len":    self.entry_params.band_ema_len,
+                                "tp_pct":          self.exit_params.tp_pct,
+                                "sl_pct":          self.exit_params.sl_pct,
+                                "exit_ma_len":     self.exit_params.exit_ma_len,
+                                "exit_band_mult":  self.exit_params.exit_band_mult,
                             }
 
                         opt = optimise_params(
@@ -778,7 +781,13 @@ class LiveRealTrader:
                 ts_utc=_ts_reopt, symbol=best_sym, interval=best_iv,
                 event=_event,
                 ma_len=best_entry.ma_len, band_mult=best_entry.band_mult,
+                adx_threshold=best_entry.adx_threshold,
+                rsi_neutral_lo=best_entry.rsi_neutral_lo,
+                band_ema_len=best_entry.band_ema_len,
                 tp_pct=best_exit_p.tp_pct,
+                sl_pct=best_exit_p.sl_pct,
+                exit_ma_len=best_exit_p.exit_ma_len,
+                exit_band_mult=best_exit_p.exit_band_mult,
                 mc_score=new_mc_score if new_mc_score != float("-inf") else None,
                 sharpe=best_br.sharpe_ratio, pnl_pct=best_br.pnl_pct,
                 max_drawdown_pct=best_br.max_drawdown_pct,
@@ -963,7 +972,11 @@ class LiveRealTrader:
             if _raw_short > 0:
                 self._last_signal_ts = time.time()
 
-            _final_short = resolve_entry_signals(_raw_short, adx_val, rsi_val)
+            _final_short = resolve_entry_signals(
+                _raw_short, adx_val, rsi_val,
+                adx_threshold=self.entry_params.adx_threshold,
+                rsi_neutral_lo=self.entry_params.rsi_neutral_lo,
+            )
             entry_sig = _final_short > 0
             _raw_exit = compute_exit_signals_raw(
                 current_row=row, prev_row=prev,

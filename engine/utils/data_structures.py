@@ -12,6 +12,9 @@ from .constants import (
     DEFAULT_EXIT_BAND_MULT,
     DEFAULT_TP_PCT,
     STOP_LOSS_PCT,
+    ADX_THRESHOLD,
+    RSI_NEUTRAL_LO,
+    BAND_EMA_LENGTH,
 )
 
 
@@ -83,11 +86,16 @@ class EntryParams:
 
     Entry fires when:
         high drops back below premium_k band (crossover of band above high)
-        AND ADX < 25 (range-bound regime)
-        AND RSI >= 50 (neutral-to-overbought close confirms the fade)
+        AND ADX < adx_threshold (range-bound regime; default 25)
+        AND RSI >= rsi_neutral_lo (neutral-to-overbought close confirms the fade; default 50)
+
+    All five fields are optimised at runtime by the random-search optimizer.
     """
-    ma_len:    int   = DEFAULT_MA_LEN    # RMA period for band centre line
-    band_mult: float = DEFAULT_BAND_MULT # Band width multiplier (%)
+    ma_len:         int   = DEFAULT_MA_LEN    # RMA period for band centre line
+    band_mult:      float = DEFAULT_BAND_MULT # Band width multiplier (%)
+    adx_threshold:  float = ADX_THRESHOLD     # Max ADX for entry (range-bound gate)
+    rsi_neutral_lo: float = RSI_NEUTRAL_LO    # Min RSI at close (overbought confirmation)
+    band_ema_len:   int   = BAND_EMA_LENGTH   # EMA smoothing on all 8 premium/discount bands
 
 
 @dataclass

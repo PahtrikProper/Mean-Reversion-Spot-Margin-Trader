@@ -17,13 +17,14 @@ import pandas as pd
 import numpy as np
 from typing import Optional
 
+from ..utils.constants import ADX_THRESHOLD, RSI_NEUTRAL_LO, BAND_EMA_LENGTH
+
 # ─── Fixed gate constants ────────────────────────────────────────────────────────
 
 ADX_PERIOD     = 14
-ADX_THRESHOLD  = 25.0
 RSI_PERIOD     = 14
-RSI_NEUTRAL_LO = 50.0
-BAND_EMA_LENGTH = 5
+# ADX_THRESHOLD, RSI_NEUTRAL_LO, BAND_EMA_LENGTH imported from constants
+# (re-exported here so existing imports like `from indicators import ADX_THRESHOLD` still work)
 
 
 # ─── RMA (Relative Moving Average) ──────────────────────────────────────────────
@@ -64,28 +65,34 @@ def ema(series: np.ndarray, length: int) -> np.ndarray:
 
 # ─── Premium / Discount Bands ────────────────────────────────────────────────────
 
-def build_bands(df: pd.DataFrame, ma_len: int, band_mult: float) -> pd.DataFrame:
+def build_bands(
+    df: pd.DataFrame,
+    ma_len: int,
+    band_mult: float,
+    band_ema_len: int = BAND_EMA_LENGTH,
+) -> pd.DataFrame:
     """Construct 8 premium + 8 discount bands.
 
     main        = RMA(close, ma_len)
-    premium_k   = EMA(main * (1 + band_mult * 0.01 * k), 5)
-    discount_k  = EMA(main * (1 - band_mult * 0.01 * k), 5)
+    premium_k   = EMA(main * (1 + band_mult * 0.01 * k), band_ema_len)
+    discount_k  = EMA(main * (1 - band_mult * 0.01 * k), band_ema_len)
     where k in [1, 8]
 
-    Example with band_mult=2.5:
+    Example with band_mult=2.5, band_ema_len=5:
       Band 1: main * 1.025 (premium), main * 0.975 (discount)
       Band 8: main * 1.200 (premium), main * 0.800 (discount)
     """
     df = df.copy()
     df["main"] = rma(df["close"], int(ma_len))
     main_values = df["main"].to_numpy(dtype=float)
+    _ema_len = max(1, int(band_ema_len))
 
     for k in range(1, 9):
         premium_raw = main_values * (1.0 + float(band_mult) * 0.01 * k)
-        df[f"premium_{k}"] = ema(premium_raw, length=BAND_EMA_LENGTH)
+        df[f"premium_{k}"] = ema(premium_raw, length=_ema_len)
 
         discount_raw = main_values * (1.0 - float(band_mult) * 0.01 * k)
-        df[f"discount_{k}"] = ema(discount_raw, length=BAND_EMA_LENGTH)
+        df[f"discount_{k}"] = ema(discount_raw, length=_ema_len)
 
     return df
 
@@ -224,6 +231,7 @@ def build_indicators(
     band_mult: float,
     exit_ma_len: Optional[int] = None,
     exit_band_mult: Optional[float] = None,
+    band_ema_len: int = BAND_EMA_LENGTH,
 ) -> pd.DataFrame:
     """Build all indicators needed for entry and exit.
 
@@ -237,15 +245,17 @@ def build_indicators(
         adx            — ADX(14) Wilder (entry gate)
         rsi            — RSI(14) Wilder (entry gate)
         atr            — ATR(14) Wilder  (retained for diagnostic DB logging)
+
+    band_ema_len controls EMA smoothing applied to all 8 bands (both premium + discount).
     """
     # Build entry (premium) bands — and discount bands from same params as baseline
-    df = build_bands(df_raw.copy(), ma_len, band_mult)
+    df = build_bands(df_raw.copy(), ma_len, band_mult, band_ema_len=band_ema_len)
 
     # Overwrite discount_k columns with exit-specific params when they differ
     _exit_ma = exit_ma_len    if exit_ma_len    is not None else ma_len
     _exit_bm = exit_band_mult if exit_band_mult is not None else band_mult
-    if _exit_ma != ma_len or _exit_bm != band_mult:
-        df_exit = build_bands(df_raw.copy(), _exit_ma, _exit_bm)
+    if _exit_ma != ma_len or _exit_bm != band_mult or band_ema_len != BAND_EMA_LENGTH:
+        df_exit = build_bands(df_raw.copy(), _exit_ma, _exit_bm, band_ema_len=band_ema_len)
         for k in range(1, 9):
             df[f"discount_{k}"] = df_exit[f"discount_{k}"].values
 
@@ -341,24 +351,33 @@ def compute_exit_signals_raw(
 
 # ─── Signal quality gates ────────────────────────────────────────────────────────
 
-def resolve_entry_signals(raw_short: int, adx: float, rsi: float) -> int:
+def resolve_entry_signals(
+    raw_short: int,
+    adx: float,
+    rsi: float,
+    adx_threshold: float = ADX_THRESHOLD,
+    rsi_neutral_lo: float = RSI_NEUTRAL_LO,
+) -> int:
     """Apply ADX and RSI gates to filter raw band-crossover entry signals.
 
     Gate 1 — ADX regime (checked first):
-        ADX >= 25 → trending market → block ALL SHORT entries
+        ADX >= adx_threshold → trending market → block ALL SHORT entries
     Gate 2 — RSI confirmation:
-        RSI < 50  → close below neutral → block SHORT (close must confirm overbought; don't fade a
-                    move where the candle already closed weakly)
+        RSI < rsi_neutral_lo → close below neutral → block SHORT (close must confirm
+                    overbought; don't fade a move where the candle already closed weakly)
+
+    adx_threshold and rsi_neutral_lo default to the module-level constants but can be
+    overridden per-trial by the optimizer for parameter search.
 
     Returns final signal (0 = no trade, 1-8 = band level).
     """
     # Gate 1: ADX regime filter
-    if adx >= ADX_THRESHOLD:
+    if adx >= adx_threshold:
         return 0
 
     # Gate 2: RSI confirmation
     final_short = raw_short
-    if final_short != 0 and rsi < RSI_NEUTRAL_LO:
+    if final_short != 0 and rsi < rsi_neutral_lo:
         final_short = 0
 
     return final_short
