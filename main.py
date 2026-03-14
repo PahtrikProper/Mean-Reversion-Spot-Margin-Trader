@@ -22,7 +22,6 @@ import logging
 import argparse
 import threading
 import time as _time
-from pathlib import Path
 
 # In dev mode, ensure the project root is importable.
 # In a PyInstaller frozen bundle all modules are already embedded — skip this.
@@ -56,14 +55,13 @@ import engine as bot_module
 from engine.utils import constants as const_module
 from engine.utils.constants import (
     SYMBOLS, CANDLE_INTERVALS, DAYS_BACK_SEED,
-    DEFAULT_TP_PCT, MAX_ACTIVE_SYMBOLS,
+    MAX_ACTIVE_SYMBOLS,
     PAPER_SYMBOLS, PAPER_STARTING_BALANCE,
 )
 from engine.utils.api_key_prompt import ensure_api_credentials
 from engine.utils.helpers import (
     leverage_for, taker_fee_for, maker_fee_for, supported_intervals,
 )
-from engine.utils.data_structures import EntryParams, ExitParams
 from engine.trading.paper_trader import _download_seed as _paper_download_seed
 from engine.utils import db_logger as _db
 

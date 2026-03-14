@@ -10,7 +10,7 @@ Exit:   TP (fixed), stop-loss (hard SL, optimised), or band exit
 
 from .utils.data_structures import (
     TradeRecord, BacktestResult, MCSimResult,
-    EntryParams, ExitParams, Params,
+    EntryParams, ExitParams,
     RealPosition, PendingSignal,
 )
 from .utils.position_gate import PositionGate

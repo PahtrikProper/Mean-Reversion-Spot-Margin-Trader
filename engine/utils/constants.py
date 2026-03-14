@@ -181,10 +181,6 @@ else:
 LOG_DIR         = os.path.join(BASE_DIR, "data")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-EVENT_LOG_PATH  = os.path.join(LOG_DIR, "events.log")
-TRADES_CSV_PATH = os.path.join(LOG_DIR, "trades.csv")
-PARAMS_CSV_PATH = os.path.join(LOG_DIR, "params.csv")
-ORDERS_LOG_PATH = os.path.join(LOG_DIR, "orders.log")
 DB_PATH         = os.path.join(LOG_DIR, "trading.db")
 
 # ── Initialize SQLite database ────────────────────────────────────────────────

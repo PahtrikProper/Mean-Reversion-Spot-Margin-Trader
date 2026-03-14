@@ -199,8 +199,3 @@ def print_monte_carlo_report(
     log.info(f"    PnL:     {_pc(p5)}{p5:+.2f}%{_MC_RESET}  ←→  {_pc(p95)}{p95:+.2f}%{_MC_RESET}")
     log.info(f"{_MC_CYAN}{'═' * 64}{_MC_RESET}")
     log.info("")
-
-
-# ----------------------------
-# BAYESIAN OPTIMISER (Optuna TPE)
-# ----------------------------

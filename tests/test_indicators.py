@@ -130,7 +130,7 @@ class TestComputeEntrySignalsRaw:
         prev_row, curr_row = self._make_rows(band_val=100.0, prev_high=102.0, curr_high=100.0)
         result = compute_entry_signals_raw(
             current_row=curr_row, prev_row=prev_row,
-            current_high=98.0, current_low=95.0,
+            current_high=98.0,
         )
         assert result > 0
         assert 1 <= result <= 8
@@ -141,7 +141,7 @@ class TestComputeEntrySignalsRaw:
         prev_row, curr_row = self._make_rows(band_val=100.0, prev_high=95.0, curr_high=100.0)
         result = compute_entry_signals_raw(
             current_row=curr_row, prev_row=prev_row,
-            current_high=90.0, current_low=85.0,
+            current_high=90.0,
         )
         assert result == 0
 
@@ -155,7 +155,7 @@ class TestComputeEntrySignalsRaw:
         curr_row["high"] = float("nan")
         result = compute_entry_signals_raw(
             current_row=curr_row, prev_row=prev_row,
-            current_high=95.0, current_low=90.0,
+            current_high=95.0,
         )
         assert isinstance(result, int)
         assert 0 <= result <= 8

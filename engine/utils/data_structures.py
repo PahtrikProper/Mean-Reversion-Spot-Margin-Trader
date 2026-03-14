@@ -123,10 +123,6 @@ class ExitParams:
     exit_band_mult: float = DEFAULT_EXIT_BAND_MULT # exit band width multiplier (%)
 
 
-# Legacy alias
-Params = EntryParams
-
-
 @dataclass
 class RealPosition:
     """Snapshot of the live Bybit position fetched via REST."""

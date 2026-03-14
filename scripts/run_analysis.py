@@ -180,7 +180,7 @@ def analyse_interval(symbol: str, interval: str, days: int = 1, trials: int = 40
 
         raw = compute_entry_signals_raw(
             current_row=row, prev_row=prev,
-            current_high=float(row["high"]), current_low=float(row["low"]),
+            current_high=float(row["high"]),
         )
         if raw > 0:
             raw_signals += 1

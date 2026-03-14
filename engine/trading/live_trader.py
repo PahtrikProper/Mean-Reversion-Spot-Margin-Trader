@@ -966,7 +966,7 @@ class LiveRealTrader:
 
             _raw_short = compute_entry_signals_raw(
                 current_row=row, prev_row=prev,
-                current_high=h, current_low=l,
+                current_high=h,
             )
             # ── Signal drought tracking ──────────────────────────────────────────
             if _raw_short > 0:
@@ -980,7 +980,7 @@ class LiveRealTrader:
             entry_sig = _final_short > 0
             _raw_exit = compute_exit_signals_raw(
                 current_row=row, prev_row=prev,
-                current_low=l, current_high=h,
+                current_low=l,
             )
             exit_sig = _raw_exit > 0
 

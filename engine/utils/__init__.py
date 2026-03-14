@@ -2,7 +2,7 @@
 
 from .data_structures import (
     TradeRecord, BacktestResult, MCSimResult,
-    EntryParams, ExitParams, Params,
+    EntryParams, ExitParams,
     RealPosition, PendingSignal,
 )
 from .position_gate import PositionGate
@@ -20,7 +20,7 @@ from .trading_status import (
 
 __all__ = [
     "TradeRecord", "BacktestResult", "MCSimResult",
-    "EntryParams", "ExitParams", "Params",
+    "EntryParams", "ExitParams",
     "RealPosition", "PendingSignal", "PositionGate",
     "log_order", "ensure_csv", "csv_append",
     "plot_pnl_chart", "print_monte_carlo_report",

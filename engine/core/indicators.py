@@ -291,7 +291,6 @@ def compute_entry_signals_raw(
     current_row,    # dict or Series: must contain premium_1..8 and "high"
     prev_row,       # dict or Series: must contain premium_1..8 and "high"
     current_high: float,
-    current_low: float,
 ) -> int:
     """Scan premium bands 8→1 for SHORT entry signals.
 
@@ -320,7 +319,6 @@ def compute_exit_signals_raw(
     current_row,    # dict or Series: must contain discount_1..8 and "low"
     prev_row,       # dict or Series: must contain discount_1..8 and "low"
     current_low: float,
-    current_high: float,
 ) -> int:
     """Scan discount bands 8→1 for SHORT exit signals.
 

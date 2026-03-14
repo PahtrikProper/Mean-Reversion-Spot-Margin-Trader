@@ -29,23 +29,15 @@ from ..utils.constants import (
     TICK_SIZE,
     TIME_TP_HOURS,
 )
-from ..utils.data_structures import TradeRecord, BacktestResult, MCSimResult, EntryParams, ExitParams
+from ..utils.data_structures import TradeRecord, BacktestResult, MCSimResult, EntryParams, ExitParams, MC_SIMS, MC_MIN_TRADES
 from ..core.indicators import (
     build_indicators,
     compute_entry_signals_raw,
     resolve_entry_signals,
     compute_exit_signals_raw,
 )
+from ..core.orders import apply_slippage
 from ..trading.liquidation import liquidation_price_short_isolated, pick_risk_tier
-
-
-def _apply_slippage(price: float, side: str) -> float:
-    if SLIPPAGE_TICKS <= 0:
-        return float(price)
-    delta = SLIPPAGE_TICKS * TICK_SIZE
-    if side == "sell":
-        return float(price) - delta
-    return float(price) + delta   # "buy"
 
 
 # ─── Single backtest run ────────────────────────────────────────────────────────
@@ -183,7 +175,7 @@ def backtest_once(
                 _active_tp_pct  = time_tp_pct
             tp_price = entry_price_bt * (1.0 - _active_tp_pct)
             if low_last <= tp_price:
-                fill      = _apply_slippage(tp_price, "buy")
+                fill      = apply_slippage(tp_price, "buy")
                 pnl_gross = (entry_price_bt - fill) * qty_abs
                 exit_fee  = (qty_abs * fill) * fee_rate
                 wallet   += pnl_gross - exit_fee
@@ -207,7 +199,7 @@ def backtest_once(
             if not exited and pos_qty != 0.0:
                 sl_price = entry_price_bt * (1.0 + float(exit_params.sl_pct))
                 if high_last >= sl_price:
-                    fill      = _apply_slippage(close, "buy")
+                    fill      = apply_slippage(close, "buy")
                     pnl_gross = (entry_price_bt - fill) * qty_abs
                     exit_fee  = (qty_abs * fill) * fee_rate
                     wallet   += pnl_gross - exit_fee
@@ -228,10 +220,10 @@ def backtest_once(
             if not exited and pos_qty != 0.0:
                 _raw_exit = compute_exit_signals_raw(
                     current_row=row, prev_row=prev,
-                    current_low=low_last, current_high=high_last,
+                    current_low=low_last,
                 )
                 if _raw_exit > 0:
-                    fill      = _apply_slippage(close, "buy")
+                    fill      = apply_slippage(close, "buy")
                     pnl_gross = (entry_price_bt - fill) * qty_abs
                     exit_fee  = (qty_abs * fill) * fee_rate
                     wallet   += pnl_gross - exit_fee
@@ -253,7 +245,7 @@ def backtest_once(
         if not exited and not in_position and wallet > 0.0:
             _raw_short = compute_entry_signals_raw(
                 current_row=row, prev_row=prev,
-                current_high=high_last, current_low=low_last,
+                current_high=high_last,
             )
             _rsi_val = float(row["rsi"]) if not pd.isna(row["rsi"]) else 100.0
             if resolve_entry_signals(
@@ -261,7 +253,7 @@ def backtest_once(
                 adx_threshold=entry_params.adx_threshold,
                 rsi_neutral_lo=entry_params.rsi_neutral_lo,
             ) > 0:
-                fill            = _apply_slippage(close, "sell")
+                fill            = apply_slippage(close, "sell")
                 wallet_at_entry = wallet
                 notional        = wallet * leverage
                 qty             = notional / fill
@@ -319,9 +311,6 @@ def backtest_once(
 
 
 # ─── Monte Carlo ───────────────────────────────────────────────────────────────
-
-MC_SIMS       = 5000
-MC_MIN_TRADES = 5
 
 
 def _mc_simulate_one(trades, starting_wallet, n_trades):

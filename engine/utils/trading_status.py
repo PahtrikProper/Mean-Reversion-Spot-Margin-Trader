@@ -64,7 +64,6 @@ class TradingStatusMonitor:
 
     def _check_alerts(self):
         """Print WARNING banners when signal drought or max-loss threshold detected."""
-        import time as _t
         with self.lock:
             traders = dict(self.traders_ref)
         if not traders:
@@ -77,7 +76,7 @@ class TradingStatusMonitor:
                 last_ts = getattr(trader, "_last_signal_ts", None)
                 if last_ts is None:
                     continue
-                elapsed = _t.time() - last_ts
+                elapsed = time.time() - last_ts
                 if elapsed >= drought_threshold:
                     hrs = elapsed / 3600.0
                     # Only print every full-status interval to avoid spam
@@ -96,7 +95,7 @@ class TradingStatusMonitor:
                 if halted:
                     halt_ts = getattr(trader, "_halt_ts", None)
                     if halt_ts is not None:
-                        remaining = max(0.0, 4 * 3600.0 - (_t.time() - halt_ts))
+                        remaining = max(0.0, 4 * 3600.0 - (time.time() - halt_ts))
                         msg = (
                             f"\n🛑  MAX-LOSS HALT  {symbol}  —  "
                             f"resumes in {remaining/3600:.1f}h\n"
