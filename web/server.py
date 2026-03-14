@@ -5,8 +5,10 @@ Reads directly from data/trading.db (read-only) — never writes.
 Runs in a background daemon thread launched from main.py or gui.py.
 
 Usage:
-    from web.server import start
+    from web.server import start, set_chart_ready
     port = start()          # starts on 127.0.0.1:8765
+    # ... after first optimisation completes ...
+    set_chart_ready()       # signals browser may now open
     import webbrowser; webbrowser.open(f"http://127.0.0.1:{port}")
 """
 
@@ -28,6 +30,17 @@ PORT       = 8765
 _server_thread: Optional[threading.Thread] = None
 _started        = threading.Event()
 _active_port    = PORT
+
+# ── Chart-ready gate ───────────────────────────────────────────────────────────
+# Set by the trader after the first optimisation + DB seed completes.
+# main.py / gui.py wait on this before opening Firefox.
+chart_ready_event = threading.Event()
+
+
+def set_chart_ready() -> None:
+    """Signal that the first optimisation is done and the chart is populated."""
+    chart_ready_event.set()
+    log.info("Chart ready — browser may open")
 
 
 # ── DB helper ─────────────────────────────────────────────────────────────────
@@ -58,6 +71,11 @@ def _make_app():
             str(STATIC_DIR / "index.html"),
             headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
         )
+
+    # ── REST: chart-ready flag ─────────────────────────────────────────────────
+    @app.get("/api/ready")
+    async def ready():
+        return JSONResponse({"ready": chart_ready_event.is_set()})
 
     # ── REST: historical candles + bands ──────────────────────────────────────
     @app.get("/api/history")
@@ -100,7 +118,7 @@ def _make_app():
             conn = _get_conn()
             rows = conn.execute(
                 """
-                SELECT ts_utc, action, side, fill_price, qty, pnl_net, result
+                SELECT ts_utc, action, side, fill_price, qty, pnl_net, result, mode
                 FROM   trades
                 WHERE  symbol = ? AND interval = ?
                 ORDER  BY ts_utc DESC
@@ -151,7 +169,7 @@ def _make_app():
             last_ts_ms = row[0] if (row and row[0]) else 0
 
             row2 = conn.execute(
-                "SELECT MAX(id) FROM trades WHERE symbol=? AND interval=?",
+                "SELECT MAX(id) FROM trades WHERE symbol=? AND interval=? AND mode != 'backtest'",
                 (symbol, interval),
             ).fetchone()
             last_trade_id = row2[0] if (row2 and row2[0]) else 0
@@ -181,12 +199,12 @@ def _make_app():
                     await websocket.send_json({"type": "candle", "data": dict(row)})
                     last_ts_ms = row["time"]
 
-                # ── New trades ─────────────────────────────────────────────────
+                # ── New live/paper trades only (not backtest) ──────────────────
                 new_trades = conn.execute(
                     """
-                    SELECT id, ts_utc, action, fill_price, result
+                    SELECT id, ts_utc, action, fill_price, result, mode
                     FROM   trades
-                    WHERE  symbol=? AND interval=? AND id > ?
+                    WHERE  symbol=? AND interval=? AND id > ? AND mode != 'backtest'
                     ORDER  BY id
                     """,
                     (symbol, interval, last_trade_id),

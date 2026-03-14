@@ -585,19 +585,29 @@ def main():
     _start_maintenance_thread()
 
     # ── Chart server (background, non-blocking) ────────────────────────────
+    # Server starts immediately; browser opens only after the first
+    # optimisation completes and set_chart_ready() is called.
     try:
-        from web.server import start as _start_chart
+        from web.server import start as _start_chart, chart_ready_event as _chart_ready
         _chart_port = _start_chart()
         _chart_url  = f"http://127.0.0.1:{_chart_port}"
-        print(f"  Chart server ready → {_chart_url}")
-        try:
-            import subprocess
-            if sys.platform == "darwin":
-                subprocess.Popen(["open", "-a", "Firefox", _chart_url])
-            else:
-                webbrowser.get("firefox").open(_chart_url)
-        except Exception:
-            webbrowser.open(_chart_url)
+        print(f"  Chart server ready → {_chart_url}  (browser opens after first optimisation)")
+
+        def _open_browser_when_ready():
+            _chart_ready.wait(timeout=900)  # up to 15 min for first optimisation
+            if not _chart_ready.is_set():
+                return
+            try:
+                import subprocess
+                if sys.platform == "darwin":
+                    subprocess.Popen(["open", "-a", "Firefox", _chart_url])
+                else:
+                    webbrowser.get("firefox").open(_chart_url)
+            except Exception:
+                webbrowser.open(_chart_url)
+
+        threading.Thread(target=_open_browser_when_ready, daemon=True,
+                         name="chart-browser-opener").start()
     except Exception as _e:
         print(f"  Chart server unavailable: {_e}")
 

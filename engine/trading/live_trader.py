@@ -863,6 +863,21 @@ class LiveRealTrader:
                     log.info(f"[LIVE] Seeded {n_ana} candle_analytics rows → DB")
                 except Exception as _ana_err:
                     log.warning(f"[LIVE] bulk_log_seed_analytics failed: {_ana_err}")
+                # Write backtest trades to DB so chart can display them as markers
+                try:
+                    _db.bulk_log_backtest_trades(
+                        trade_records=getattr(best_br, "trade_records", []) or [],
+                        symbol=self.symbol, interval=self.interval,
+                        entry_params=self.entry_params, exit_params=self.exit_params,
+                    )
+                except Exception as _bt_err:
+                    log.warning(f"[LIVE] bulk_log_backtest_trades failed: {_bt_err}")
+                # Signal chart is ready for the first optimisation
+                try:
+                    from web.server import set_chart_ready
+                    set_chart_ready()
+                except Exception:
+                    pass
                 log.info(
                     f"[REOPT] params updated  {self.symbol} {self.interval}m  "
                     f"MC={new_mc_score:.4f}"

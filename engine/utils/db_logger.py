@@ -1523,3 +1523,92 @@ def run_maintenance(vacuum: bool = False) -> None:
 
     except Exception as exc:
         log.warning(f"[DB][MAINT] Maintenance failed: {exc}")
+
+
+# ── Backtest trade bulk-write ──────────────────────────────────────────────────
+
+def bulk_log_backtest_trades(
+    trade_records,        # List[TradeRecord]
+    symbol: str,
+    interval: str,
+    entry_params,         # EntryParams (for ma_len, band_mult, tp_pct)
+    exit_params,          # ExitParams
+) -> None:
+    """Replace all backtest trades for (symbol, interval) with the new result.
+
+    Inserts two rows per TradeRecord (ENTRY + EXIT) using the candle timestamps
+    stored in entry_ts_ms / exit_ts_ms.  Mode is set to 'backtest' so the
+    chart can render them with a different style from live / paper fills.
+
+    Called once per optimisation cycle (after the best result is accepted)
+    from both paper_trader and live_trader.
+    """
+    if _conn is None:
+        return
+    if not trade_records:
+        return
+
+    def _ms_to_iso(ms: int) -> str:
+        """Convert epoch-ms to ISO-8601 UTC string for ts_utc column."""
+        try:
+            return datetime.datetime.utcfromtimestamp(ms / 1000.0).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        except Exception:
+            return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    rows = []
+    for tr in trade_records:
+        entry_iso = _ms_to_iso(tr.entry_ts_ms) if tr.entry_ts_ms else _ms_to_iso(0)
+        exit_iso  = _ms_to_iso(tr.exit_ts_ms)  if tr.exit_ts_ms  else entry_iso
+        notional  = tr.qty * tr.entry_price
+        result    = "WIN" if tr.pnl_net > 0 else "LOSS"
+        ma_len    = getattr(entry_params, "ma_len",    0)
+        band_mult = getattr(entry_params, "band_mult", 0.0)
+        tp_pct    = getattr(exit_params,  "tp_pct",    0.0)
+
+        # ENTRY row
+        rows.append((
+            entry_iso, "backtest", symbol, interval, "ENTRY", "BAND_ENTRY", tr.side,
+            _safe(tr.qty), _safe(tr.entry_price), _safe(notional), _safe(tr.entry_fee),
+            _safe(tr.entry_price), None, None,
+            _safe(tr.wallet_at_entry), None,
+            None, None, None, None, "",
+            ma_len, _safe(band_mult), _safe(tp_pct),
+        ))
+        # EXIT row
+        exit_notional = tr.qty * tr.exit_price
+        rows.append((
+            exit_iso, "backtest", symbol, interval, "EXIT", tr.reason, tr.side,
+            _safe(tr.qty), _safe(tr.exit_price), _safe(exit_notional), _safe(tr.exit_fee),
+            _safe(tr.entry_price), None, None,
+            None, _safe(tr.wallet_at_entry + tr.pnl_net),
+            _safe(tr.pnl_gross), _safe(tr.pnl_net), None,
+            _safe(tr.return_pct * 100.0), result,
+            ma_len, _safe(band_mult), _safe(tp_pct),
+        ))
+
+    sql = """INSERT INTO trades (
+        ts_utc, mode, symbol, interval, action, reason, side,
+        qty, fill_price, notional, fee,
+        entry_price, tp_price, mark_price,
+        wallet_before, wallet_after,
+        pnl_gross, pnl_net, pnl_1x_usdt, pnl_pct, result,
+        ma_len, band_mult, tp_pct
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+
+    try:
+        with _lock:
+            # Clear previous backtest trades for this symbol/interval
+            _conn.execute(
+                "DELETE FROM trades WHERE mode='backtest' AND symbol=? AND interval=?",
+                (symbol, interval),
+            )
+            _conn.executemany(sql, rows)
+            _conn.commit()
+        log.debug(
+            "[DB] bulk_log_backtest_trades: wrote %d rows (%d trades) for %s/%s",
+            len(rows), len(trade_records), symbol, interval,
+        )
+    except Exception as exc:
+        log.warning("[DB] bulk_log_backtest_trades failed: %s", exc)

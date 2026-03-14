@@ -118,6 +118,7 @@ def backtest_once(
 
     # Time-based TP tightening — tracks when entry occurred and whether applied
     entry_candle_idx:   int  = 0
+    entry_ts_ms_bt:     int  = 0   # ms timestamp of entry candle (for chart markers)
     time_tp_applied:    bool = False
     _time_tp_candles:   int  = (
         int(TIME_TP_HOURS * 60 / max(interval_minutes_bt, 1))
@@ -157,12 +158,15 @@ def backtest_once(
                 wallet    = max(0.0, wallet)
                 pnl_net   = pnl_gross - entry_fee - exit_fee
                 trade_pnls.append(pnl_net)
+                _exit_ts_raw = dfl.iloc[i]["ts"]
+                _exit_ts_ms  = int(_exit_ts_raw.value) // 1_000_000 if hasattr(_exit_ts_raw, "value") else int(_exit_ts_raw)
                 trade_records.append(TradeRecord(
                     side="SHORT", entry_price=entry_price_bt, exit_price=liq,
                     qty=qty_abs, entry_fee=entry_fee, exit_fee=exit_fee,
                     pnl_gross=pnl_gross, pnl_net=pnl_net,
                     reason="LIQUIDATION", wallet_at_entry=wallet_at_entry,
                     hold_candles=i - entry_candle_idx,
+                    entry_ts_ms=entry_ts_ms_bt, exit_ts_ms=_exit_ts_ms,
                 ))
                 wallet_history.append(wallet)
                 liquidated = True
@@ -184,6 +188,8 @@ def backtest_once(
                 wallet   += pnl_gross - exit_fee
                 pnl_net   = pnl_gross - entry_fee - exit_fee
                 trade_pnls.append(pnl_net)
+                _exit_ts_raw = dfl.iloc[i]["ts"]
+                _exit_ts_ms  = int(_exit_ts_raw.value) // 1_000_000 if hasattr(_exit_ts_raw, "value") else int(_exit_ts_raw)
                 trade_records.append(TradeRecord(
                     side="SHORT", entry_price=entry_price_bt, exit_price=fill,
                     qty=qty_abs, entry_fee=entry_fee, exit_fee=exit_fee,
@@ -191,6 +197,7 @@ def backtest_once(
                     reason="TIME_TP" if time_tp_applied else "TP",
                     wallet_at_entry=wallet_at_entry,
                     hold_candles=i - entry_candle_idx,
+                    entry_ts_ms=entry_ts_ms_bt, exit_ts_ms=_exit_ts_ms,
                 ))
                 pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                 wallet_at_entry = 0.0; in_position = False
@@ -209,12 +216,15 @@ def backtest_once(
                     wallet   += pnl_gross - exit_fee
                     pnl_net   = pnl_gross - entry_fee - exit_fee
                     trade_pnls.append(pnl_net)
+                    _exit_ts_raw = dfl.iloc[i]["ts"]
+                    _exit_ts_ms  = int(_exit_ts_raw.value) // 1_000_000 if hasattr(_exit_ts_raw, "value") else int(_exit_ts_raw)
                     trade_records.append(TradeRecord(
                         side="SHORT", entry_price=entry_price_bt, exit_price=fill,
                         qty=qty_abs, entry_fee=entry_fee, exit_fee=exit_fee,
                         pnl_gross=pnl_gross, pnl_net=pnl_net,
                         reason="STOP_LOSS", wallet_at_entry=wallet_at_entry,
                         hold_candles=i - entry_candle_idx,
+                        entry_ts_ms=entry_ts_ms_bt, exit_ts_ms=_exit_ts_ms,
                     ))
                     pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                     wallet_at_entry = 0.0; in_position = False
@@ -234,6 +244,8 @@ def backtest_once(
                     wallet   += pnl_gross - exit_fee
                     pnl_net   = pnl_gross - entry_fee - exit_fee
                     trade_pnls.append(pnl_net)
+                    _exit_ts_raw = dfl.iloc[i]["ts"]
+                    _exit_ts_ms  = int(_exit_ts_raw.value) // 1_000_000 if hasattr(_exit_ts_raw, "value") else int(_exit_ts_raw)
                     trade_records.append(TradeRecord(
                         side="SHORT", entry_price=entry_price_bt, exit_price=fill,
                         qty=qty_abs, entry_fee=entry_fee, exit_fee=exit_fee,
@@ -241,6 +253,7 @@ def backtest_once(
                         reason="BAND_EXIT",
                         wallet_at_entry=wallet_at_entry,
                         hold_candles=i - entry_candle_idx,
+                        entry_ts_ms=entry_ts_ms_bt, exit_ts_ms=_exit_ts_ms,
                     ))
                     pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                     wallet_at_entry = 0.0; in_position = False
@@ -277,6 +290,8 @@ def backtest_once(
                     entry_fee            = fee
                     in_position      = True
                     entry_candle_idx = i          # record candle index for time TP
+                    _ts_raw          = dfl.iloc[i]["ts"]
+                    entry_ts_ms_bt   = int(_ts_raw.value) // 1_000_000 if hasattr(_ts_raw, "value") else int(_ts_raw)
                     time_tp_applied      = False
 
         # ── Equity snapshot ───────────────────────────────────────────────────

@@ -802,8 +802,8 @@ class App(ctk.CTk):
         self._build_ui()
         self._load_saved_keys()
         self._poll()
-        # Auto-start chart server and open browser after the window is ready
-        self.after(1500, self._open_chart)
+        # Auto-start chart server (browser opens only after first optimisation)
+        self.after(1500, self._start_chart_server)
 
     # ── UI Construction ───────────────────────────────────────────────────────
     def _build_ui(self) -> None:
@@ -1566,21 +1566,43 @@ class App(ctk.CTk):
             self._ctrl.stop()
 
     # ── Chart server ──────────────────────────────────────────────────────────
+    def _start_chart_server(self) -> None:
+        """Start the chart server.  Browser opens after the first optimisation completes."""
+        try:
+            from web.server import start as _start_chart, chart_ready_event as _chart_ready
+            import threading as _threading
+            url = f"http://127.0.0.1:{_start_chart()}"
+
+            def _open_when_ready():
+                _chart_ready.wait(timeout=900)  # up to 15 min for first optimisation
+                if not _chart_ready.is_set():
+                    return
+                self._open_chart_url(url)
+
+            _threading.Thread(target=_open_when_ready, daemon=True,
+                               name="chart-browser-opener").start()
+        except Exception as exc:
+            self._lbl_ctrl_msg.configure(text=f"Chart server error: {exc}")
+
     def _open_chart(self) -> None:
-        """Start the Lightweight Charts server (if not running) and open in Firefox."""
+        """Open the chart in Firefox (called from the 'Open Chart' button)."""
         try:
             from web.server import start as _start_chart
-            import subprocess, sys as _sys
             url = f"http://127.0.0.1:{_start_chart()}"
-            try:
-                if _sys.platform == "darwin":
-                    subprocess.Popen(["open", "-a", "Firefox", url])
-                else:
-                    webbrowser.get("firefox").open(url)
-            except Exception:
-                webbrowser.open(url)
+            self._open_chart_url(url)
         except Exception as exc:
             self._lbl_ctrl_msg.configure(text=f"Chart error: {exc}")
+
+    def _open_chart_url(self, url: str) -> None:
+        """Open the given URL in Firefox (or fallback browser)."""
+        try:
+            import subprocess, sys as _sys
+            if _sys.platform == "darwin":
+                subprocess.Popen(["open", "-a", "Firefox", url])
+            else:
+                webbrowser.get("firefox").open(url)
+        except Exception:
+            webbrowser.open(url)
 
     # ── Queue polling ─────────────────────────────────────────────────────────
     def _poll(self) -> None:

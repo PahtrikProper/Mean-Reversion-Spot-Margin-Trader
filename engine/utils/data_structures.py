@@ -35,6 +35,8 @@ class TradeRecord:
     reason:          str           # "TP", "TIME_TP", "STOP_LOSS", "BAND_EXIT", "LIQUIDATION"
     wallet_at_entry: float = 0.0
     hold_candles:    int   = 0     # candles held from entry to exit
+    entry_ts_ms:     int   = 0     # candle open timestamp at entry (ms since epoch)
+    exit_ts_ms:      int   = 0     # candle open timestamp at exit  (ms since epoch)
 
     @property
     def return_pct(self) -> float:
