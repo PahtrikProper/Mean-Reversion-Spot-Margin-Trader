@@ -1391,7 +1391,14 @@ def start_live_ws(
             _backoff = min(5 * (2 ** _ws_attempt), 60)
             _ws_attempt += 1
             log.warning(f"WebSocket disconnected. Reconnecting in {_backoff}s (attempt {_ws_attempt})...")
-            time.sleep(_backoff)
+            # Use stop_event.wait() instead of time.sleep() so a Stop request
+            # during the reconnect backoff takes effect immediately (returns True
+            # when the event is set, False when the timeout expires normally).
+            if stop_event:
+                if stop_event.wait(timeout=_backoff):
+                    break
+            else:
+                time.sleep(_backoff)
     finally:
         _ping_stop["stop"] = True
         status_monitor.stop()

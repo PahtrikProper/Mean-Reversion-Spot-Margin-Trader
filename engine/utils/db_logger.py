@@ -81,8 +81,15 @@ def validate_or_reset_db(db_path: str) -> bool:
     # Minimum expected total-column count per table (PRAGMA table_info returns
     # one row per column, including the autoincrement id).  Raise these numbers
     # whenever new columns are added to keep the check current.
+    # Note: params table uses ALTER TABLE migration — existing DBs are upgraded
+    # in init_db() so the count should always reach 21 on startup.
     _EXPECTED_MIN: dict = {
         "candle_analytics": 56,   # id + 52 base + exit_ma_len + exit_band_mult + sl_pct
+        "params":           21,   # id + ts_utc + symbol + interval + event +
+                                  # ma_len + band_mult + adx_threshold + rsi_neutral_lo +
+                                  # band_ema_len + tp_pct + sl_pct + exit_ma_len +
+                                  # exit_band_mult + mc_score + sharpe + pnl_pct +
+                                  # max_drawdown_pct + trade_count + winrate + wallet
     }
 
     stale = False

@@ -103,6 +103,37 @@ def _apply_config(cfg: dict) -> None:
             C.INIT_TRIALS = int(cfg["optimizer"]["n_trials"])
 
 
+def _save_config(updates: dict) -> None:
+    """Persist a partial settings update into default_config.json.
+
+    Merges `updates` into the existing file with one level of deep-merge for
+    nested dicts (e.g. ``{"exit": {"tp_pct": 0.005}}`` correctly updates only
+    that key inside the "exit" block, leaving other keys intact).
+
+    Called by the GUI Apply buttons so that user changes to TP / leverage are
+    picked up on the next bot start (or restart), not silently reverted by
+    ``_apply_config()`` which reads the file on every ``_run()`` invocation.
+
+    Errors are silently swallowed so a read-only filesystem never crashes the GUI.
+    """
+    base = sys._MEIPASS if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(base, "engine", "config", "default_config.json")
+    try:
+        cfg: dict = {}
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        for key, val in updates.items():
+            if isinstance(val, dict) and isinstance(cfg.get(key), dict):
+                cfg[key].update(val)
+            else:
+                cfg[key] = val
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
+
+
 # ── Agent best-params warm-start helper ──────────────────────────────────────
 _BEST_PARAMS_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "best_params.json")
 _AGENT_PARAMS_MAX_AGE = 12 * 3600   # treat agent analysis as fresh for 12 h
@@ -1550,6 +1581,8 @@ class App(ctk.CTk):
         # liquidation price calculation uses the correct leverage from the start.
         for sym in C.SYMBOLS:
             C.LEVERAGE_BY_SYMBOL[sym] = lev
+        # Persist so restart picks up the new value instead of reverting to config file.
+        _save_config({"leverage": lev})
         self._lbl_leverage_status.configure(
             text=f"Current: {int(lev)}x  (paper — live syncs from Bybit)",
             text_color="#3fb950",
@@ -1563,6 +1596,8 @@ class App(ctk.CTk):
             return
         pct = round(max(0.1, min(6.0, pct)), 4)
         C.DEFAULT_TP_PCT = pct / 100.0
+        # Persist so restart picks up the new value instead of reverting to config file.
+        _save_config({"exit": {"tp_pct": C.DEFAULT_TP_PCT}})
         self._lbl_tp_status.configure(
             text=f"Current: {pct:.1f}%  (applied before analysis starts)",
             text_color="#3fb950",
