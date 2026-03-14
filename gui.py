@@ -802,6 +802,8 @@ class App(ctk.CTk):
         self._build_ui()
         self._load_saved_keys()
         self._poll()
+        # Auto-start chart server and open browser after the window is ready
+        self.after(1500, self._open_chart)
 
     # ── UI Construction ───────────────────────────────────────────────────────
     def _build_ui(self) -> None:
