@@ -1419,6 +1419,7 @@ def start_live_ws(
 
 def download_seed_history(symbol: str, days_back: int, interval: str):
     """Download last-price and mark-price kline history for seeding the live trader."""
+    import engine.utils.db_logger as _db
     end_ts   = now_ms()
     start_ts = end_ts - int(days_back * 24 * 60 * 60 * 1000)
 
@@ -1429,5 +1430,10 @@ def download_seed_history(symbol: str, days_back: int, interval: str):
     log.info(f"Downloading MARK-price {interval}m history for {symbol} ({days_back} days)...")
     df_mark = fetch_mark_klines(symbol, interval, start_ts, end_ts)
     log.info(f"Mark-price candles: {len(df_mark)}")
+
+    # Persist seed candles to DB so the chart has data from startup
+    n_last = _db.bulk_log_seed_candles(df_last, symbol, interval, "last")
+    n_mark = _db.bulk_log_seed_candles(df_mark, symbol, interval, "mark")
+    log.info(f"Seeded {n_last} last-price + {n_mark} mark-price candles → DB")
 
     return df_last, df_mark

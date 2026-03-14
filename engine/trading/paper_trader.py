@@ -1152,10 +1152,15 @@ class PaperTrader:
 
 def _download_seed(symbol: str, days_back: int, interval: str):
     """Download last-price and mark-price klines for a symbol via public REST."""
+    import engine.utils.db_logger as _db
     end_ts   = now_ms()
     start_ts = end_ts - int(days_back * 24 * 60 * 60 * 1000)
     log.info(f"[PAPER] Downloading LAST-price {interval}m for {symbol} ({days_back} days)...")
     df_last = fetch_last_klines(symbol, interval, start_ts, end_ts)
     log.info(f"[PAPER] Downloading MARK-price {interval}m for {symbol} ({days_back} days)...")
     df_mark = fetch_mark_klines(symbol, interval, start_ts, end_ts)
+    # Persist seed candles to DB so the chart has data from startup
+    n_last = _db.bulk_log_seed_candles(df_last, symbol, interval, "last")
+    n_mark = _db.bulk_log_seed_candles(df_mark, symbol, interval, "mark")
+    log.info(f"[PAPER] Seeded {n_last} last-price + {n_mark} mark-price candles → DB")
     return df_last, df_mark

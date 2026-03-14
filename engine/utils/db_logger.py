@@ -530,6 +530,42 @@ def log_candle(
     )
 
 
+def bulk_log_seed_candles(
+    df,           # pd.DataFrame with columns: ts, open, high, low, close, volume (optional)
+    symbol: str,
+    interval: str,
+    price_type: str,   # 'last' or 'mark'
+) -> int:
+    """Bulk-insert historical seed candles so the chart has data from startup.
+
+    Uses INSERT OR IGNORE so re-seeding never creates duplicates.
+    Returns the number of rows inserted.
+    """
+    import pandas as _pd
+    rows = []
+    vol_col = "volume" if "volume" in df.columns else None
+    for _, row in df.iterrows():
+        ts_ms  = int(row["ts"])
+        ts_utc = _pd.Timestamp(ts_ms, unit="ms", tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
+        vol    = float(row[vol_col]) if vol_col else 0.0
+        rows.append((
+            ts_utc, ts_ms, symbol, interval, price_type,
+            float(row["open"]), float(row["high"]),
+            float(row["low"]),  float(row["close"]), vol,
+        ))
+    if not rows:
+        return 0
+    with _lock:
+        _conn.executemany(
+            "INSERT OR IGNORE INTO candles "
+            "(ts_utc,ts_ms,symbol,interval,price_type,open,high,low,close,volume) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+        _conn.commit()
+    return len(rows)
+
+
 def log_candle_analytics(
     ts_utc: str,
     symbol: str,
