@@ -174,11 +174,7 @@
   <div class="logo">⬛ MRT</div>
   <div class="sep"></div>
   <select class="tv-select" id="sel-symbol"></select>
-  <select class="tv-select" id="sel-interval">
-    <option value="1">1m</option>
-    <option value="3">3m</option>
-    <option value="5" selected>5m</option>
-  </select>
+  <div class="tv-select" style="cursor:default;">15m</div>
   <div class="sep"></div>
   <div id="status-wrap">
     <div id="status-dot"></div>
@@ -450,7 +446,7 @@ function clearAll() {
 
 // ── Load history from REST ─────────────────────────────────────────────────────
 let symbol   = 'XRPUSDT';
-let interval = '5';
+let interval = '15';
 
 async function loadHistory() {
   document.getElementById('loading').classList.remove('hidden');
@@ -531,11 +527,6 @@ document.getElementById('sel-symbol').addEventListener('change', e => {
   loadHistory();
   reconnect();
 });
-document.getElementById('sel-interval').addEventListener('change', e => {
-  interval = e.target.value;
-  loadHistory();
-  reconnect();
-});
 
 // ── WebSocket ──────────────────────────────────────────────────────────────────
 let ws              = null;
@@ -593,8 +584,6 @@ ro.observe(volEl);
 // ── Init ──────────────────────────────────────────────────────────────────────
 (async () => {
   await loadSymbols();
-  // Match selector to default interval
-  document.getElementById('sel-interval').value = interval;
   await loadHistory();
   connect();
 })();

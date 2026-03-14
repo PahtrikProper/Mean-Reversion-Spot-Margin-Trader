@@ -6,7 +6,7 @@ from typing import Dict
 
 # ── Symbol & trading setup ────────────────────────────────────────────────────
 SYMBOLS          = ["XRPUSDT"]
-CANDLE_INTERVALS = ["1", "3", "5"]          # 1m, 3m, 5m
+CANDLE_INTERVALS = ["15"]                   # 15m only
 CATEGORY         = "linear"
 
 # ── Paper trading ─────────────────────────────────────────────────────────────
