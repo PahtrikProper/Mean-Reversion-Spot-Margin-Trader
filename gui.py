@@ -98,6 +98,9 @@ def _apply_config(cfg: dict) -> None:
     if "exit" in cfg:
         xc = cfg["exit"]
         if "tp_pct"       in xc: C.DEFAULT_TP_PCT       = float(xc["tp_pct"])
+    if "days_back_seed"   in cfg: C.DAYS_BACK_SEED      = int(cfg["days_back_seed"])
+    if "candle_intervals" in cfg: C.CANDLE_INTERVALS     = [str(v) for v in cfg["candle_intervals"]]
+    if "risk_pct"         in cfg: C.MAX_SYMBOL_FRACTION  = float(cfg["risk_pct"])
     if "optimizer" in cfg:
         if "n_trials" in cfg["optimizer"]:
             C.INIT_TRIALS = int(cfg["optimizer"]["n_trials"])
@@ -1525,6 +1528,7 @@ class App(ctk.CTk):
             return
         pct = max(10, min(95, pct))
         C.MAX_SYMBOL_FRACTION = pct / 100.0
+        _save_config({"risk_pct": pct / 100.0})
         self._lbl_risk_status.configure(
             text=f"Current: {pct}% of funds per trade",
             text_color="#3fb950",
@@ -1538,6 +1542,7 @@ class App(ctk.CTk):
             return
         days = max(1, days)
         C.DAYS_BACK_SEED = days
+        _save_config({"days_back_seed": days})
         self._lbl_days_status.configure(
             text=f"Current: {days} day(s) of history",
             text_color="#3fb950",
@@ -1564,6 +1569,7 @@ class App(ctk.CTk):
         )
         if selected:
             C.CANDLE_INTERVALS = selected
+            _save_config({"candle_intervals": selected})
             self._lbl_intervals_status.configure(
                 text=f"Current: {', '.join(iv + 'm' for iv in selected)}",
                 text_color="#3fb950",
