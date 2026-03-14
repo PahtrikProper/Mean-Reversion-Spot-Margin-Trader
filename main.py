@@ -590,7 +590,14 @@ def main():
         _chart_port = _start_chart()
         _chart_url  = f"http://127.0.0.1:{_chart_port}"
         print(f"  Chart server ready → {_chart_url}")
-        webbrowser.open(_chart_url)
+        try:
+            import subprocess
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", "-a", "Firefox", _chart_url])
+            else:
+                webbrowser.get("firefox").open(_chart_url)
+        except Exception:
+            webbrowser.open(_chart_url)
     except Exception as _e:
         print(f"  Chart server unavailable: {_e}")
 

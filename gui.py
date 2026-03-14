@@ -1606,11 +1606,18 @@ class App(ctk.CTk):
 
     # ── Chart server ──────────────────────────────────────────────────────────
     def _open_chart(self) -> None:
-        """Start the Lightweight Charts server (if not running) and open browser."""
+        """Start the Lightweight Charts server (if not running) and open in Firefox."""
         try:
             from web.server import start as _start_chart
-            port = _start_chart()
-            webbrowser.open(f"http://127.0.0.1:{port}")
+            import subprocess, sys as _sys
+            url = f"http://127.0.0.1:{_start_chart()}"
+            try:
+                if _sys.platform == "darwin":
+                    subprocess.Popen(["open", "-a", "Firefox", url])
+                else:
+                    webbrowser.get("firefox").open(url)
+            except Exception:
+                webbrowser.open(url)
         except Exception as exc:
             self._lbl_ctrl_msg.configure(text=f"Chart error: {exc}")
 

@@ -457,7 +457,7 @@ async function loadHistory() {
   clearAll();
   try {
     const [histRes, tradeRes] = await Promise.all([
-      fetch(`${BASE}/api/history?symbol=${symbol}&interval=${interval}&limit=500`),
+      fetch(`${BASE}/api/history?symbol=${symbol}&interval=${interval}&limit=10000`),
       fetch(`${BASE}/api/trades?symbol=${symbol}&interval=${interval}`),
     ]);
     const hist   = await histRes.json();

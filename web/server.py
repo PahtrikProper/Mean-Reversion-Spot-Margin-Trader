@@ -58,7 +58,7 @@ def _make_app():
 
     # ── REST: historical candles + bands ──────────────────────────────────────
     @app.get("/api/history")
-    async def history(symbol: str = "XRPUSDT", interval: str = "1", limit: int = 500):
+    async def history(symbol: str = "XRPUSDT", interval: str = "1", limit: int = 10000):
         try:
             conn = _get_conn()
             rows = conn.execute(
