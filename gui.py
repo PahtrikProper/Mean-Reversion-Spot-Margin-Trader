@@ -1551,6 +1551,7 @@ class App(ctk.CTk):
         n = max(1000, n)
         C.INIT_TRIALS  = n
         C.OPT_N_RANDOM = n
+        _save_config({"optimizer": {"n_trials": n}})
         self._lbl_tests_status.configure(
             text=f"Current: {n:,} tests",
             text_color="#3fb950",
