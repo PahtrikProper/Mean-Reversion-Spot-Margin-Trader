@@ -530,6 +530,15 @@ def log_candle(
     )
 
 
+def _ts_to_ms(ts_val) -> int:
+    """Convert a ts column value (int ms, float ms, or pd.Timestamp) to int milliseconds."""
+    if hasattr(ts_val, 'value'):           # pd.Timestamp — .value is nanoseconds
+        return int(ts_val.value) // 1_000_000
+    if hasattr(ts_val, 'timestamp'):       # datetime object
+        return int(ts_val.timestamp() * 1000)
+    return int(ts_val)                     # already int/float ms
+
+
 def bulk_log_seed_candles(
     df,           # pd.DataFrame with columns: ts, open, high, low, close, volume (optional)
     symbol: str,
@@ -545,7 +554,7 @@ def bulk_log_seed_candles(
     rows = []
     vol_col = "volume" if "volume" in df.columns else None
     for _, row in df.iterrows():
-        ts_ms  = int(row["ts"])
+        ts_ms  = _ts_to_ms(row["ts"])
         ts_utc = _pd.Timestamp(ts_ms, unit="ms", tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
         vol    = float(row[vol_col]) if vol_col else 0.0
         rows.append((
@@ -623,7 +632,7 @@ def bulk_log_seed_analytics(
 
     rows = []
     for i, (_, row) in enumerate(df.iterrows()):
-        ts_ms  = int(row["ts"])
+        ts_ms  = _ts_to_ms(row["ts"])
         ts_utc = _pd.Timestamp(ts_ms, unit="ms", tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
 
         o   = _s(row.get("open"))
