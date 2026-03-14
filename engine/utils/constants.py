@@ -6,16 +6,12 @@ from typing import Dict
 
 # ── Symbol & trading setup ────────────────────────────────────────────────────
 SYMBOLS          = ["XRPUSDT"]
-CANDLE_INTERVALS = ["15"]                   # 15m only
-CATEGORY         = "linear"
-
-# ── Paper trading ─────────────────────────────────────────────────────────────
-PAPER_STARTING_BALANCE = 500.0
-PAPER_SYMBOLS = ["XRPUSDT"]
+CANDLE_INTERVALS = ["5"]                    # 5m only
+CATEGORY         = "spot"
 
 DAYS_BACK_SEED    = 30                       # history window for seed + re-opt (max 30 days)
 STARTING_WALLET   = 100.0
-DEFAULT_LEVERAGE  = 10.0                     # fallback before first optimizer run
+DEFAULT_LEVERAGE  = 1.0                      # spot trading: no leverage
 
 MAX_SYMBOL_FRACTION = 0.45    # max margin per symbol (45% of account)
 MAX_ACTIVE_SYMBOLS  = 1
@@ -32,14 +28,13 @@ SLIPPAGE_TICKS = 1
 TICK_SIZE      = 0.0001      # for slippage simulation
 
 # ── Live TP scaling ───────────────────────────────────────────────────────────
-# 1.0 = live TP matches backtested TP exactly (entry * (1 - tp_pct)).
-# Do NOT apply leverage here — tp_pct is a raw price-move fraction, not a
-# leveraged return.
+# 1.0 = live TP matches backtested TP exactly (entry * (1 + tp_pct) for LONG).
+# tp_pct is a raw price-move fraction.
 LIVE_TP_SCALE = 1.0
 
 # ── Time-based TP tightening ─────────────────────────────────────────────────
-# If a position is still open after TIME_TP_HOURS, the TP is overridden with a
-# data-driven tighter target so the trade exits sooner.
+# If a LONG position is still open after TIME_TP_HOURS, the TP is overridden
+# with a data-driven tighter target so the trade exits sooner.
 # The new TP = avg(top-3 highest-PnL 20h+ exits) × TIME_TP_SCALE.
 # Falls back to TIME_TP_FALLBACK_PCT when fewer than 3 qualifying trades exist.
 TIME_TP_HOURS        = 20.0   # hours after entry before tightening kicks in
@@ -55,7 +50,7 @@ DEFAULT_TP_PCT         = 0.003  # 0.30% take-profit (default; now also optimised
 
 # ── Entry gate defaults (also optimised at runtime) ───────────────────────────
 ADX_THRESHOLD   = 25.0  # ADX must be below this for entry (range-bound regime)
-RSI_NEUTRAL_LO  = 50.0  # RSI must be >= this at candle close (overbought confirmation)
+RSI_NEUTRAL_LO  = 50.0  # RSI must be <= this at candle close (oversold confirmation for LONG)
 BAND_EMA_LENGTH = 5     # EMA smoothing period applied to all 8 premium/discount bands
 ADX_PERIOD      = 14    # Wilder's ADX calculation period (optimised at runtime; default 14)
 RSI_PERIOD      = 14    # Wilder's RSI calculation period (optimised at runtime; default 14)
@@ -67,13 +62,19 @@ RSI_PERIOD      = 14    # Wilder's RSI calculation period (optimised at runtime;
 # almost never fires; making it a search dim would add noise without signal.
 VOL_FILTER_MAX_PCT = 0.05   # 5% of candle USDT volume
 
-# ── Hard stop-loss (SHORT exit) ───────────────────────────────────────────────
-# Fires when: current_high >= entry_price * (1 + sl_pct)
-# Intentionally wide — designed to prevent full liquidation, not to be
-# routinely triggered.  Optimised alongside TP.
-# Typical optimised range: 0.50–9.00% above entry (stays inside liq at ~10%
-# for 10× leverage; liquidation threshold varies with margin fraction).
-STOP_LOSS_PCT = 0.05     # default 5.0% above entry (optimised at runtime)
+# ── Hard stop-loss (LONG exit) ────────────────────────────────────────────────
+# Fires when: current_low <= entry_price * (1 - sl_pct)
+# Intentionally wide — designed as a last-resort guard, not routinely triggered.
+# Optimised alongside TP.
+STOP_LOSS_PCT = 0.05     # default 5.0% below entry (optimised at runtime)
+
+# ── Jason McIntosh trailing stop ──────────────────────────────────────────────
+# Tracks the highest candle-high since LONG entry.
+# Trail fires when: current_low <= highest_high_since_entry * (1 - TRAIL_STOP_PCT)
+# The trail level only rises — it never moves down.
+# Priority: highest — fires before TP and hard stop-loss.
+# Set to 0.0 to disable.
+TRAIL_STOP_PCT = 0.02    # 2.0% trailing stop below the highest high since entry
 
 # ── Optimiser search ranges ───────────────────────────────────────────────────
 INIT_TRIALS          = 4000
@@ -101,7 +102,7 @@ OPT_TP_MIN_BP       = 20    # 0.20% price move (1× ATR on 3-min)
 OPT_TP_MAX_BP       = 100   # 1.00% price move (2.5× ATR on 15-min)
 
 # Stop-loss (in basis points; 50 = 0.50%, 900 = 9.00%)
-# Upper bound kept below liquidation threshold (~10% for 10× leverage).
+# Upper bound set for reasonable downside protection on 1× spot.
 OPT_SL_MIN_BP       = 50    # 0.50% above entry
 OPT_SL_MAX_BP       = 900   # 9.00% above entry
 
@@ -127,13 +128,13 @@ OPT_ADX_PERIOD_MAX  = 21
 OPT_RSI_PERIOD_MIN  = 7
 OPT_RSI_PERIOD_MAX  = 21
 
-# Leverage (integer steps; 2 = conservative, 14 = aggressive; replaces GUI setting)
-OPT_LEVERAGE_MIN    = 2
-OPT_LEVERAGE_MAX    = 14
+# Leverage (fixed at 1 for spot trading — no leverage)
+OPT_LEVERAGE_MIN    = 1
+OPT_LEVERAGE_MAX    = 1
 
-# Backtest window per trial (days; drawn uniformly at random for each trial)
+# Backtest window per trial (days; fixed at 5 for fast spot optimisation)
 OPT_MIN_DAYS        = 5
-OPT_MAX_DAYS        = 30
+OPT_MAX_DAYS        = 5
 
 OPT_N_RANDOM      = INIT_TRIALS
 OPT_MIN_TRADES    = 1
@@ -153,7 +154,7 @@ EXPLOIT_RSI_LO_RADIUS             = 5    # ±5 around saved best RSI neutral-low
 EXPLOIT_BAND_EMA_RADIUS           = 2    # ±2 around saved best band EMA length
 EXPLOIT_ADX_PERIOD_RADIUS         = 2    # ±2 around saved best ADX period
 EXPLOIT_RSI_PERIOD_RADIUS         = 2    # ±2 around saved best RSI period
-EXPLOIT_LEVERAGE_RADIUS           = 2    # ±2× around saved best leverage
+EXPLOIT_LEVERAGE_RADIUS           = 0    # leverage fixed at 1 for spot
 
 # ── Runtime behaviour ─────────────────────────────────────────────────────────
 KEEP_CANDLES            = 3000

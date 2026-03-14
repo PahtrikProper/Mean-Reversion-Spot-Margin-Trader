@@ -234,9 +234,12 @@ def fetch_last_klines(symbol: str, interval: str, start_ms: int, end_ms: int) ->
 
 def fetch_mark_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
     """
-    /v5/market/mark-price-kline -> returns 5 columns
-    [start, open, high, low, close]
+    For spot: mark price doesn't exist — return last-price klines instead.
+    For linear: /v5/market/mark-price-kline -> [start, open, high, low, close]
     """
+    if CATEGORY == "spot":
+        return fetch_last_klines(symbol, interval, start_ms, end_ms)
+
     path = "/v5/market/mark-price-kline"
     out = []
     cur = end_ms
@@ -279,8 +282,12 @@ def fetch_mark_klines(symbol: str, interval: str, start_ms: int, end_ms: int) ->
 def fetch_risk_tiers(symbol: str) -> pd.DataFrame:
     """
     /v5/market/risk-limit
-    Returns tiered MMR and mmDeduction used in liquidation
+    Returns tiered MMR and mmDeduction used in liquidation.
+    For spot: liquidation does not exist — returns an empty DataFrame.
     """
+    if CATEGORY == "spot":
+        return pd.DataFrame(columns=["riskLimitValue", "maintenanceMarginRate", "mmDeductionValue"])
+
     j = rest_get("/v5/market/risk-limit", {
         "category": CATEGORY,
         "symbol": symbol
@@ -558,8 +565,10 @@ class BybitPrivateClient:
 
     def ensure_futures_setup(self, symbol: str):
         """One-time setup for a symbol before live trading begins.
-        On Unified accounts, margin mode and position mode must be set
-        manually in the Bybit UI — only leverage can be reliably set via API."""
+        For spot: no leverage or margin mode setup needed — no-op.
+        For linear: sets leverage (margin mode must be set in Bybit UI)."""
+        if CATEGORY == "spot":
+            return
         leverage = leverage_for(symbol)
         self.set_leverage(symbol, leverage, leverage)
 
@@ -589,8 +598,10 @@ class BybitPrivateClient:
 
     def get_position(self, symbol: str) -> Optional[RealPosition]:
         """Query the current open position for a symbol.
-        Returns None if no position is open (size == 0).
-        Converts Bybit's side/size format to signed qty (positive=long, negative=short)."""
+        For spot: position is tracked locally by the bot — always returns None.
+        For linear: queries /v5/position/list; returns None if no position (size == 0)."""
+        if CATEGORY == "spot":
+            return None
         j = rest_request(
             "GET",
             "/v5/position/list",
@@ -627,26 +638,23 @@ class BybitPrivateClient:
         order_link_id: Optional[str] = None
     ) -> str:
         """Place an IOC (immediate-or-cancel) market order on Bybit.
-        Used for exits, flips, and TP fills — situations requiring immediate execution.
-        reduce_only=True restricts the order to closing an existing position.
+        For spot: positionIdx and reduceOnly are not applicable — omitted.
+        For linear: reduce_only=True restricts the order to closing an existing position.
         Returns the Bybit orderId string."""
         link_id = order_link_id or f"DLT-{int(time.time() * 1000)}-{uuid.uuid4().hex[:10]}"
-        j = rest_request(
-            "POST",
-            "/v5/order/create",
-            body={
-                "category": CATEGORY,
-                "symbol": symbol,
-                "side": side,
-                "orderType": "Market",
-                "qty": str(qty),
-                "timeInForce": "IOC",
-                "positionIdx": 0,
-                "reduceOnly": reduce_only,
-                "orderLinkId": link_id
-            },
-            auth=True
-        )
+        body: Dict[str, Any] = {
+            "category": CATEGORY,
+            "symbol": symbol,
+            "side": side,
+            "orderType": "Market",
+            "qty": str(qty),
+            "timeInForce": "IOC",
+            "orderLinkId": link_id,
+        }
+        if CATEGORY != "spot":
+            body["positionIdx"] = 0
+            body["reduceOnly"] = reduce_only
+        j = rest_request("POST", "/v5/order/create", body=body, auth=True)
         return j["result"]["orderId"]
 
     def place_limit_order(
@@ -663,10 +671,11 @@ class BybitPrivateClient:
         Used for entries — ensures the order is placed on the book and never
         crosses the spread, guaranteeing maker fee rates.  If the price would
         cross, Bybit rejects the order immediately.
+        For spot: positionIdx and reduceOnly are not applicable — omitted.
         Optionally includes a server-side take-profit (LastPrice triggered).
         Returns the Bybit orderId string."""
         link_id = order_link_id or f"DLT-{int(time.time() * 1000)}-{uuid.uuid4().hex[:10]}"
-        body = {
+        body: Dict[str, Any] = {
             "category": CATEGORY,
             "symbol": symbol,
             "side": side,
@@ -674,19 +683,15 @@ class BybitPrivateClient:
             "qty": str(qty),
             "price": f"{price:.8f}",
             "timeInForce": "PostOnly",
-            "positionIdx": 0,
-            "reduceOnly": reduce_only,
-            "orderLinkId": link_id
+            "orderLinkId": link_id,
         }
+        if CATEGORY != "spot":
+            body["positionIdx"] = 0
+            body["reduceOnly"] = reduce_only
         if take_profit is not None:
             body["takeProfit"] = f"{take_profit:.8f}"
             body["tpTriggerBy"] = "LastPrice"
-        j = rest_request(
-            "POST",
-            "/v5/order/create",
-            body=body,
-            auth=True
-        )
+        j = rest_request("POST", "/v5/order/create", body=body, auth=True)
         return j["result"]["orderId"]
 
     def get_order_status(self, symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
@@ -749,11 +754,10 @@ class BybitPrivateClient:
 
     def set_trading_stop(self, symbol: str, take_profit: float) -> None:
         """Set a server-side take-profit on an open position via Bybit's trading-stop API.
-        Uses LastPrice as the trigger.  Called immediately after a successful entry fill
-        so the exchange will auto-close the position at the TP price even if the bot disconnects.
-
-        tpslMode='Full' is required for Bybit Unified accounts — without it Bybit returns
-        an error (retCode != 0).  'Full' means the TP covers the entire position."""
+        For spot: not supported — no-op (TP is managed client-side in the bot loop).
+        For linear: uses LastPrice trigger; tpslMode='Full' required for Unified accounts."""
+        if CATEGORY == "spot":
+            return
         # Format as a clean string: strip trailing zeros but keep at least 1 decimal place
         # (take_profit is already tick-rounded by _format_price in live_trader).
         tp_str = f"{take_profit:.10f}".rstrip("0")

@@ -4,6 +4,7 @@ Searches for the best combination of 12 dimensions:
   EntryParams: ma_len, band_mult, adx_threshold, rsi_neutral_lo, band_ema_len,
                adx_period, rsi_period
   ExitParams:  tp_pct, sl_pct, exit_ma_len, exit_band_mult, leverage
+               trail_pct is fixed at TRAIL_STOP_PCT (not optimised)
 
 band_mult / exit_band_mult are stored as integer × 10 (3 = 0.3, 100 = 10.0)
 during search for efficient integer arithmetic.
@@ -11,10 +12,10 @@ during search for efficient integer arithmetic.
 tp_pct is searched in OPT_TP_MIN_BP–OPT_TP_MAX_BP (basis points × 0.0001).
 sl_pct is optimised in OPT_SL_MIN_BP–OPT_SL_MAX_BP (basis points × 0.0001).
 adx_period / rsi_period searched in OPT_ADX/RSI_PERIOD_MIN–MAX (7–21).
-leverage searched in OPT_LEVERAGE_MIN–OPT_LEVERAGE_MAX (2–14, integer steps).
+leverage fixed at 1× (spot — no leverage).
 
-Per-trial backtest window: uniform random days ∈ [OPT_MIN_DAYS, OPT_MAX_DAYS]
-(5–30 days), random start offset within the 30-day seeded dataset.
+Per-trial backtest window: fixed 5 days, random start offset within the
+30-day seeded dataset.
 All windows generated upfront before threads are spawned (RNG is not thread-safe).
 
 Uses randomised search with exploitation/exploration split:
@@ -265,14 +266,14 @@ def optimise_params(
         print(f"  Entry    — MA-len {OPT_MA_LEN_MIN}-{OPT_MA_LEN_MAX}  "
               f"BandMult {OPT_BAND_MULT_X10_MIN/10:.1f}-{OPT_BAND_MULT_X10_MAX/10:.1f}%  "
               f"BandEMA {OPT_BAND_EMA_MIN}-{OPT_BAND_EMA_MAX}")
-        print(f"  Gates    — ADX<{OPT_ADX_MIN}-{OPT_ADX_MAX}  RSI>={OPT_RSI_LO_MIN}-{OPT_RSI_LO_MAX}")
+        print(f"  Gates    — ADX<{OPT_ADX_MIN}-{OPT_ADX_MAX}  RSI<={OPT_RSI_LO_MIN}-{OPT_RSI_LO_MAX}")
         print(f"  Periods  — ADX {OPT_ADX_PERIOD_MIN}-{OPT_ADX_PERIOD_MAX}  RSI {OPT_RSI_PERIOD_MIN}-{OPT_RSI_PERIOD_MAX}")
         print(f"  Exit     — TP {OPT_TP_MIN_BP*0.01:.2f}%-{OPT_TP_MAX_BP*0.01:.2f}%  "
               f"SL {OPT_SL_MIN_BP*0.01:.2f}%-{OPT_SL_MAX_BP*0.01:.2f}%")
         print(f"  ExitBand — MA-len {OPT_EXIT_MA_LEN_MIN}-{OPT_EXIT_MA_LEN_MAX}  "
               f"BandMult {OPT_EXIT_BAND_MULT_X10_MIN/10:.1f}-{OPT_EXIT_BAND_MULT_X10_MAX/10:.1f}%")
-        print(f"  Leverage — {OPT_LEVERAGE_MIN}×–{OPT_LEVERAGE_MAX}×")
-        print(f"  Window   — {OPT_MIN_DAYS}–{OPT_MAX_DAYS} days (random per trial)")
+        print(f"  Leverage — 1×–1× (spot)")
+        print(f"  Window   — {OPT_MIN_DAYS} days (fixed)")
         if saved_best:
             print(f"  Mode: {n_exploit} exploitation + {len(combos)-n_exploit} exploration")
         else:
@@ -450,7 +451,7 @@ def optimise_params(
             f"\n✓ OPTIMISATION COMPLETE [{event_name}]:\n"
             f"  Entry    — MA-len={best_entry.ma_len}  BandMult={best_entry.band_mult:.2f}%  "
             f"BandEMA={best_entry.band_ema_len}\n"
-            f"  Gates    — ADX<{best_entry.adx_threshold:.0f}  RSI>={best_entry.rsi_neutral_lo:.0f}\n"
+            f"  Gates    — ADX<{best_entry.adx_threshold:.0f}  RSI<={best_entry.rsi_neutral_lo:.0f}\n"
             f"  Periods  — ADX({best_entry.adx_period})  RSI({best_entry.rsi_period})\n"
             f"  ExitBand — MA-len={best_exit.exit_ma_len}  BandMult={best_exit.exit_band_mult:.2f}%\n"
             f"  TP={best_exit.tp_pct*100:.2f}%  SL={best_exit.sl_pct*100:.2f}%  "

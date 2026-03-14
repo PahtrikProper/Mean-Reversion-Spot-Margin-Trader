@@ -1,11 +1,11 @@
 """
-Mean Reversion Trader — Bybit USDT Futures (SHORT only)
+Mean Reversion Trader — Bybit Spot (LONG only)
 
-Entry:  high drops back below premium_k band (crossover)
+Entry:  low crosses back above discount_k band (crossover)
         AND ADX < 25  (range-bound regime)
-        AND RSI >= 50 (neutral-to-overbought close confirms the fade)
-Exit:   TP (fixed), stop-loss (hard SL, optimised), or band exit
-        Band: low drops below discount_k band (mirrors entry logic)
+        AND RSI <= 50 (neutral-to-oversold close confirms the bounce)
+Exit:   Trail stop (Jason McIntosh), TP, hard SL, or band exit
+        Band: high drops above premium_k band (mirrors entry logic)
 """
 
 from .utils.data_structures import (
@@ -29,8 +29,6 @@ from .trading.bybit_client import (
     get_instrument_info,
 )
 from .trading.live_trader import LiveRealTrader, start_live_ws, download_seed_history
-from .trading.paper_trader import PaperTrader
-from .trading.liquidation import pick_risk_tier, liquidation_price_short_isolated
 from .backtest.backtester import backtest_once, run_monte_carlo, mc_score
 from .optimize.optimizer import optimise_params, optimise_bayesian
 

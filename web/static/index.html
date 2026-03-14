@@ -190,7 +190,7 @@
   <div class="logo">⬛ MRT</div>
   <div class="sep"></div>
   <select class="tv-select" id="sel-symbol"></select>
-  <div class="tv-select" style="cursor:default;">15m</div>
+  <div class="tv-select" style="cursor:default;">5m</div>
   <div class="sep"></div>
   <div id="status-wrap">
     <div id="status-dot"></div>
@@ -216,7 +216,7 @@
   <div id="legend">
     <div class="legend-item">
       <div class="legend-swatch" style="background:#ef5350;"></div>
-      <span>Premium bands (entry)</span>
+      <span>Premium bands (exit)</span>
     </div>
     <div class="legend-item">
       <div class="legend-swatch" style="background:#5470c6;"></div>
@@ -224,15 +224,15 @@
     </div>
     <div class="legend-item">
       <div class="legend-swatch" style="background:#26a69a;"></div>
-      <span>Discount bands (exit)</span>
+      <span>Discount bands (entry)</span>
     </div>
     <div class="legend-item" style="margin-top:4px;">
       <div style="width:8px;height:8px;border-radius:50%;background:#ef5350;flex-shrink:0;"></div>
-      <span>Live/paper SHORT entry</span>
+      <span>Live LONG entry</span>
     </div>
     <div class="legend-item">
       <div style="width:8px;height:8px;border-radius:50%;background:#26a69a;flex-shrink:0;"></div>
-      <span>Live/paper exit</span>
+      <span>Live exit</span>
     </div>
     <div class="legend-item">
       <div style="width:6px;height:6px;border-radius:50%;background:#8888aa;flex-shrink:0;margin:1px;"></div>
@@ -329,6 +329,7 @@ const maSeries = mainChart.addLineSeries({
   priceLineVisible:  false,
   lastValueVisible:  false,
   crosshairMarkerVisible: false,
+  autoscaleInfoProvider: () => null,  // don't affect Y-axis scale
 });
 
 // ── Premium bands 1–8 (red, fades outward) ────────────────────────────────────
@@ -339,13 +340,14 @@ const PREM_COLORS = [
 const premSeries = PREM_COLORS.map((c, i) =>
   mainChart.addLineSeries({
     color:                  c,
-    lineWidth:              i === 0 ? 1 : 1,
+    lineWidth:              1,
     lineStyle:              i === 0
       ? LightweightCharts.LineStyle.Solid
       : LightweightCharts.LineStyle.Dotted,
     priceLineVisible:       false,
     lastValueVisible:       false,
     crosshairMarkerVisible: false,
+    autoscaleInfoProvider:  () => null,  // don't affect Y-axis scale
   })
 );
 
@@ -364,6 +366,7 @@ const discSeries = DISC_COLORS.map((c, i) =>
     priceLineVisible:       false,
     lastValueVisible:       false,
     crosshairMarkerVisible: false,
+    autoscaleInfoProvider:  () => null,  // don't affect Y-axis scale
   })
 );
 
@@ -432,7 +435,7 @@ function applyCandle(c) {
 
 // ── Trade markers ──────────────────────────────────────────────────────────────
 // Backtest trades: small muted circles (faded grey/blue), no price label
-// Live / paper trades: bright coloured arrows with price + result label
+// Live trades: bright coloured arrows with price + result label
 let _allMarkers = [];
 
 function _tsFromUtc(ts_utc) {
@@ -456,7 +459,7 @@ function _makeMarker(t) {
       text:     '',       // no label
     };
   } else {
-    // Bright, labelled arrows for live / paper fills
+    // Bright, labelled arrows for live fills
     return {
       time:     _tsFromUtc(t.ts_utc),
       position: isEntry ? 'aboveBar' : 'belowBar',
@@ -499,7 +502,7 @@ function clearAll() {
 
 // ── Load history from REST ─────────────────────────────────────────────────────
 let symbol   = 'XRPUSDT';
-let interval = '15';
+let interval = '5';
 
 async function loadHistory() {
   document.getElementById('loading-msg').textContent = 'Loading chart data…';

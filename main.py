@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Mean Reversion Trader — Mean Reversion Strategy (SHORT only)
+Mean Reversion Trader — Mean Reversion Strategy (LONG spot only)
 
-Entry:  high drops back below premium_k band (crossover)
+Entry:  low crosses back above discount_k band (crossover)
         AND ADX < 25  (range-bound regime)
-        AND RSI >= 50 (neutral-to-overbought close confirms the fade)
-Exit:   TP (fixed), stop-loss (hard SL, optimised), or band exit
-        Band: low drops below discount_k band (mirrors entry logic)
+        AND RSI <= 50 (neutral-to-oversold close confirms the bounce)
+Exit:   Trail stop (Jason McIntosh), TP, hard SL, or band exit
+        Band: high crosses above premium_k band (mirrors entry logic)
 
 Usage:
     python3 main.py                      # Start automated live trading
-    python3 main.py --paper              # Paper trading (no API keys required)
     python3 main.py --config <path>      # Use custom configuration file
     python3 main.py --symbols XRPUSDT    # Override trading symbols
 """
@@ -57,13 +56,11 @@ from engine.utils import constants as const_module
 from engine.utils.constants import (
     SYMBOLS, CANDLE_INTERVALS, DAYS_BACK_SEED,
     MAX_ACTIVE_SYMBOLS,
-    PAPER_SYMBOLS, PAPER_STARTING_BALANCE,
 )
 from engine.utils.api_key_prompt import ensure_api_credentials
 from engine.utils.helpers import (
     leverage_for, taker_fee_for, maker_fee_for, supported_intervals,
 )
-from engine.trading.paper_trader import _download_seed as _paper_download_seed
 from engine.utils import db_logger as _db
 
 # ── Agent best-params warm-start helper ──────────────────────────────────────
@@ -143,12 +140,12 @@ class Config:
 def run_live_trading():
     """
     Full automated flow:
-      1. For each (symbol, interval) pair across ALL PAPER_SYMBOLS: download seed + optimise
+      1. For each (symbol, interval) pair across all SYMBOLS: download seed + optimise
       2. Rank all pairs by score = PnL% / (1 + DD%)
       3. Launch LiveRealTrader for the top-ranked pair (best symbol + interval)
       4. Start WebSocket live trading
     """
-    scan_symbols = const_module.PAPER_SYMBOLS   # scan all candidates to pick the best one
+    scan_symbols = const_module.SYMBOLS
     print("=" * 65)
     print(f"  Mean Reversion Trader  |  Mean Reversion Strategy  |  scanning {', '.join(scan_symbols)}")
     print("=" * 65)
@@ -233,9 +230,17 @@ def run_live_trading():
 
             # Seed candle_analytics so /api/ready returns true immediately after
             # the first optimisation — chart browser opener polls this table.
+            # Must enrich df with indicators first so band columns are populated.
             try:
+                _df_ind = bot_module.build_indicators(
+                    df_last,
+                    ma_len=ep.ma_len, band_mult=ep.band_mult,
+                    exit_ma_len=xp.exit_ma_len, exit_band_mult=xp.exit_band_mult,
+                    band_ema_len=ep.band_ema_len,
+                    adx_period=ep.adx_period, rsi_period=ep.rsi_period,
+                )
                 _db.bulk_log_seed_analytics(
-                    df=df_last, symbol=symbol, interval=interval,
+                    df=_df_ind, symbol=symbol, interval=interval,
                     ma_len=ep.ma_len, band_mult=ep.band_mult,
                     exit_ma_len=xp.exit_ma_len,
                     exit_band_mult=float(xp.exit_band_mult),
@@ -329,204 +334,6 @@ def run_live_trading():
     print("\n  Live trading stopped.")
 
 
-def run_paper_trading():
-    """
-    Paper trading flow — no API keys required.
-    Uses public REST and WebSocket only.  Simulates fills with a virtual
-    500 USDT wallet.  Behaviour is identical to live trading.
-
-      1. For each (symbol, interval) pair: download public seed history + optimise
-      2. Rank all pairs by score
-      3. Launch PaperTrader for the top-ranked pair per symbol
-      4. Start WebSocket (public feed — no auth)
-    """
-    print("=" * 65)
-    print("  Mean Reversion Trader  |  PAPER TRADING MODE  |  No real orders")
-    print(f"  Virtual wallet: ${PAPER_STARTING_BALANCE:.0f} USDT  |  Bybit public data only")
-    print("=" * 65)
-
-    import pandas as _pd
-    _startup_ts = _pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
-    _db.log_event(ts_utc=_startup_ts, level="INFO", event_type="STARTUP",
-                  message="Paper trading session started",
-                  detail={"symbols": const_module.SYMBOLS, "mode": "paper",
-                          "starting_balance": PAPER_STARTING_BALANCE})
-
-    symbols   = const_module.SYMBOLS
-    intervals = supported_intervals(const_module.CANDLE_INTERVALS)
-    n_top     = const_module.MAX_ACTIVE_SYMBOLS
-
-    gate = bot_module.PositionGate()
-
-    print(f"\n  Symbols   : {symbols}")
-    print(f"  Intervals : {intervals}m")
-    print(f"  Leverage  : optimised per run  (default {const_module.DEFAULT_LEVERAGE:.0f}x)")
-    print(f"  Seed days : {const_module.DAYS_BACK_SEED}")
-    print(f"  Trials    : {const_module.INIT_TRIALS}\n")
-
-    all_results = {}
-
-    for symbol in symbols:
-        # Per-symbol error handling so one invalid symbol (e.g. ESPUSDT if unlisted)
-        # doesn't block the rest
-        try:
-            risk_df    = bot_module.fetch_risk_tiers(symbol)
-            instrument = bot_module.get_instrument_info(symbol)
-        except Exception as exc:
-            print(f"  SKIP {symbol}: {exc}")
-            continue
-
-        for interval in intervals:
-            try:
-                print(f"  Downloading seed history  {symbol} {interval}m ...")
-                df_last, df_mark = _paper_download_seed(symbol, const_module.DAYS_BACK_SEED, interval)
-                print(f"    last-price candles : {len(df_last)}")
-                print(f"    mark-price candles : {len(df_mark)}")
-
-                print(f"\n  Optimising {symbol} {interval}m ...")
-                opt = bot_module.optimise_bayesian(
-                    df_last          = df_last,
-                    df_mark          = df_mark,
-                    risk_df          = risk_df,
-                    trials           = const_module.INIT_TRIALS,
-                    lookback_candles = min(len(df_last), len(df_mark)),
-                    event_name       = f"PAPER_INIT_{symbol}_{interval}m",
-                    fee_rate         = taker_fee_for(symbol),
-                    maker_fee_rate   = maker_fee_for(symbol),
-                    interval_minutes = int(interval),
-                    saved_best       = _load_agent_best_params(symbol, interval),
-                    db_symbol=symbol, db_interval=interval, db_trigger="STARTUP",
-                )
-
-                ep  = opt["entry_params"]
-                xp  = opt["exit_params"]
-                br  = opt["best_result"]
-                pf  = br.pnl_pct / (1.0 + max(br.max_drawdown_pct, 0.001))
-
-                print(
-                    f"  {symbol} {interval}m  "
-                    f"MA={ep.ma_len} BandMult={ep.band_mult:.2f}%  "
-                    f"TP={xp.tp_pct*100:.4f}%  "
-                    f"WR={br.winrate:.1f}%  PnL={br.pnl_pct:.2f}%  DD={br.max_drawdown_pct:.1f}%"
-                )
-
-                all_results[(symbol, interval)] = {
-                    "entry_params": ep,
-                    "exit_params":  xp,
-                    "best_result":  br,
-                    "df_last":      df_last,
-                    "df_mark":      df_mark,
-                    "risk_df":      risk_df,
-                    "instrument":   instrument,
-                    "interval":     interval,
-                    "score":        pf,
-                }
-
-                # Seed candle_analytics so /api/ready returns true immediately after
-                # the first optimisation — chart browser opener polls this table.
-                try:
-                    _db.bulk_log_seed_analytics(
-                        df=df_last, symbol=symbol, interval=interval,
-                        ma_len=ep.ma_len, band_mult=ep.band_mult,
-                        exit_ma_len=xp.exit_ma_len,
-                        exit_band_mult=float(xp.exit_band_mult),
-                        sl_pct=float(xp.sl_pct),
-                    )
-                except Exception as _ana_err:
-                    print(f"  [DB] bulk_log_seed_analytics failed: {_ana_err}")
-                try:
-                    _db.bulk_log_backtest_trades(
-                        trade_records=getattr(br, "trade_records", []) or [],
-                        symbol=symbol, interval=interval,
-                        entry_params=ep, exit_params=xp,
-                    )
-                except Exception as _bt_err:
-                    print(f"  [DB] bulk_log_backtest_trades failed: {_bt_err}")
-
-            except Exception as exc:
-                print(f"  SKIP {symbol} {interval}m: {exc}")
-
-    if not all_results:
-        print("\n  No valid (symbol, interval) pairs found. Exiting.")
-        return
-
-    # ── Rank ──────────────────────────────────────────────────────────────────
-    ranked = sorted(all_results.items(), key=lambda x: x[1]["score"], reverse=True)
-
-    print(f"\n{'═'*80}")
-    print("  Full Results — all (symbol, interval) pairs ranked by score")
-    print(f"  Score = PnL% / (1 + DD%)  ←  higher is better")
-    print(f"{'═'*80}")
-    print(
-        f"  {'Rank':<5} {'Symbol':<12} {'Int':>4}  "
-        f"{'PnL%':>8}  {'DD%':>7}  {'Score':>9}  {'Trades':>7}  {'WR%':>6}  "
-        f"{'MA':>5} {'BandMult':>9} {'TP%':>6}"
-    )
-    print(f"  {'─'*4}  {'─'*11} {'─'*4}  {'─'*8}  {'─'*7}  {'─'*9}  {'─'*7}  {'─'*6}  "
-          f"{'─'*5} {'─'*9} {'─'*6}")
-    for rank, ((sym, iv), d) in enumerate(ranked, 1):
-        br = d["best_result"]
-        ep = d["entry_params"]
-        xp = d["exit_params"]
-        print(
-            f"  #{rank:<4} {sym:<12} {iv:>3}m  "
-            f"{br.pnl_pct:>8.2f}%  {br.max_drawdown_pct:>6.1f}%  "
-            f"{d['score']:>9.4f}  {br.trades:>7}  {br.winrate:>5.1f}%  "
-            f"{ep.ma_len:>5} {ep.band_mult:>8.2f}% "
-            f"{xp.tp_pct*100:>5.3f}%"
-        )
-    print(f"{'═'*80}\n")
-
-    # ── Select top N (one best interval per symbol) ───────────────────────────
-    selected = []
-    seen_sym = set()
-    for (sym, iv), data in ranked:
-        if sym not in seen_sym:
-            selected.append((sym, data))
-            seen_sym.add(sym)
-        if len(selected) == n_top:
-            break
-
-    print(f"  Top {n_top} selected for paper trading:")
-    for i, (sym, d) in enumerate(selected, 1):
-        br = d["best_result"]
-        ep = d["entry_params"]
-        xp = d["exit_params"]
-        print(
-            f"    #{i}  {sym}  [{d['interval']}m]  "
-            f"Score={d['score']:.4f}  PnL={br.pnl_pct:.2f}%  DD={br.max_drawdown_pct:.1f}%  "
-            f"MA={ep.ma_len} BandMult={ep.band_mult:.2f}%  "
-            f"TP={xp.tp_pct*100:.4f}%"
-        )
-    print()
-
-    # ── Instantiate PaperTraders and start WebSocket ──────────────────────────
-    traders = {}
-    for sym, data in selected:
-        print(f"  Initializing paper trader  {sym}  [{data['interval']}m] ...")
-        trader = bot_module.PaperTrader(
-            symbol       = sym,
-            df_last_seed = data["df_last"],
-            df_mark_seed = data["df_mark"],
-            risk_df      = data["risk_df"],
-            entry_params = data["entry_params"],
-            exit_params  = data["exit_params"],
-            gate         = gate,
-            interval     = data["interval"],
-            instrument   = data["instrument"],
-        )
-        traders[sym] = trader
-        trader._traders_ref = traders  # enables symbol/interval-switching during re-opt
-
-    print(f"\n  {len(traders)} paper trader(s) ready.  Starting WebSocket...\n")
-    bot_module.start_live_ws(
-        traders,
-        all_symbols=list(const_module.PAPER_SYMBOLS),
-        all_intervals=list(const_module.CANDLE_INTERVALS),
-    )
-    print("\n  Paper trading stopped.")
-
-
 def _start_maintenance_thread() -> None:
     """Start a background daemon that runs DB maintenance once at startup
     then every 24 hours while the process is alive.
@@ -570,10 +377,10 @@ def _validate_config() -> None:
         if not re.match(r"^\w{3,20}USDT$", s, re.IGNORECASE):
             errors.append(f"  symbol '{s}' looks invalid (expected format: XRPUSDT)")
 
-    valid_ivs = {"15"}
+    valid_ivs = {"1", "3", "5", "15", "30", "60", "120", "240", "360", "720", "D", "W", "M"}
     for iv in const_module.CANDLE_INTERVALS:
         if str(iv) not in valid_ivs:
-            errors.append(f"  interval '{iv}' not in Bybit set {sorted(valid_ivs, key=int)}")
+            errors.append(f"  interval '{iv}' not in Bybit set")
 
     if const_module.DAYS_BACK_SEED <= 0:
         errors.append(f"  DAYS_BACK_SEED {const_module.DAYS_BACK_SEED} must be > 0")
@@ -591,11 +398,10 @@ def _validate_config() -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Mean Reversion Trader — Automated Bybit Short-only Trading Bot"
+        description="Mean Reversion Trader — Automated Bybit LONG spot trading bot"
     )
     parser.add_argument("--config",   type=str,   default=None, help="Path to config JSON")
     parser.add_argument("--symbols",  type=str,   nargs="+",    help="Override symbols (e.g. XRPUSDT)")
-    parser.add_argument("--paper",    action="store_true",      help="Paper trading mode — no API keys required")
     parser.add_argument("--max-loss", type=float, default=None, metavar="PCT",
                         help="Halt trading for 4 h if session PnL drops by this %% (e.g. 5 = 5%%). Disabled by default.")
     args = parser.parse_args()
@@ -664,11 +470,6 @@ def main():
                          name="chart-browser-opener").start()
     except Exception as _e:
         print(f"  Chart server unavailable: {_e}")
-
-    if args.paper:
-        print("\n" + "=" * 65)
-        run_paper_trading()
-        return
 
     print("\n  Checking API credentials...")
     ensure_api_credentials()

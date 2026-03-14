@@ -22,7 +22,7 @@ from .constants import (
 )
 from . import db_logger as _db
 
-log = logging.getLogger("paper")
+log = logging.getLogger("trader")
 
 _order_log_lock = threading.Lock()
 
@@ -76,10 +76,8 @@ def log_order(
     log.info(" | ".join(parts))
 
     # Write to SQLite
-    mode = "paper" if symbol.startswith("[PAPER]") else "live"
-    clean_symbol = symbol.replace("[PAPER]", "")
     _db.log_order(
-        ts_utc=ts_utc, mode=mode, symbol=clean_symbol,
+        ts_utc=ts_utc, mode="live", symbol=symbol,
         side=side, qty=qty, price=price,
         order_type=order_type, status=status,
         order_id=order_id, reason=reason, error=error,

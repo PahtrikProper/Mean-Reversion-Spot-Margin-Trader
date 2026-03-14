@@ -6,8 +6,8 @@ from ..utils.constants import SLIPPAGE_TICKS, TICK_SIZE
 def apply_slippage(price: float, side: str) -> float:
     """
     TradingView slippage model (simple):
-      - SHORT entry (sell): worse price = price - tick
-      - COVER exit (buy):  worse price = price + tick
+      - LONG entry (buy):  worse price = price + tick
+      - LONG exit  (sell): worse price = price - tick
     """
     if SLIPPAGE_TICKS <= 0:
         return float(price)

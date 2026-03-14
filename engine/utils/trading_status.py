@@ -121,7 +121,7 @@ class TradingStatusMonitor:
             positions_open  = sum(1 for t in traders.values() if t.position is not None)
             win_rate        = (total_wins / total_trades * 100) if total_trades > 0 else 0.0
             pnl_sign        = "+" if session_pnl >= 0 else ""
-            state_str       = "SHORT" if positions_open > 0 else "FLAT"
+            state_str       = "LONG" if positions_open > 0 else "FLAT"
 
             lines = []
             lines.append("")
@@ -166,13 +166,13 @@ class TradingStatusMonitor:
                     pos     = trader.position
                     qty_abs = abs(pos.qty)
                     mark    = trader.mark_price
-                    upnl    = (pos.entry_price - mark) * qty_abs
-                    margin  = pos.entry_price * qty_abs / float(trader.leverage)
-                    upnl_pct = (upnl / margin * 100) if margin > 0 else 0.0
+                    upnl    = (mark - pos.entry_price) * qty_abs
+                    notional = pos.entry_price * qty_abs
+                    upnl_pct = (upnl / notional * 100) if notional > 0 else 0.0
                     sign    = "+" if upnl >= 0 else ""
-                    tp_disp = pos.entry_price * (1.0 - xp.tp_pct * LIVE_TP_SCALE)
+                    tp_disp = pos.entry_price * (1.0 + xp.tp_pct * LIVE_TP_SCALE)
                     lines.append(
-                        f"  SHORT  entry=${pos.entry_price:.5f}  tp=${tp_disp:.5f}  "
+                        f"  LONG   entry=${pos.entry_price:.5f}  tp=${tp_disp:.5f}  "
                         f"mark=${mark:.5f}  qty={qty_abs:.4f}  "
                         f"uPnL=${sign}{upnl:.4f} ({sign}{upnl_pct:.2f}%)"
                     )

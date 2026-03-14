@@ -252,7 +252,7 @@ def _create_tables() -> None:
     CREATE TABLE IF NOT EXISTS trades (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         ts_utc        TEXT    NOT NULL,
-        mode          TEXT,   -- 'live' or 'paper'
+        mode          TEXT,   -- 'live' or 'backtest'
         symbol        TEXT    NOT NULL,
         interval      TEXT,
         action        TEXT,   -- 'ENTRY' or 'EXIT'
@@ -1538,10 +1538,10 @@ def bulk_log_backtest_trades(
 
     Inserts two rows per TradeRecord (ENTRY + EXIT) using the candle timestamps
     stored in entry_ts_ms / exit_ts_ms.  Mode is set to 'backtest' so the
-    chart can render them with a different style from live / paper fills.
+    chart can render them with a different style from live fills.
 
     Called once per optimisation cycle (after the best result is accepted)
-    from both paper_trader and live_trader.
+    from live_trader.
     """
     if _conn is None:
         return

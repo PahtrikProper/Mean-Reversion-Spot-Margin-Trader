@@ -1,12 +1,13 @@
-"""Live Trader — Mean Reversion Strategy (SHORT only)
+"""Live Trader — Mean Reversion Strategy (LONG spot only)
 
-Entry:  high drops back below premium_k band (crossover)
+Entry:  low bounces back above discount_k band (crossover)
         AND ADX < 25  (range-bound regime)
-        AND RSI >= 50 (neutral-to-overbought close confirms the fade)
-Exit:   TP hit (Bybit server-side TP)
-        OR stop-loss: high >= entry * (1 + sl_pct)  [wide, pre-liquidation guard]
-        OR band exit: low drops below discount_k band (mirrors entry logic)
-        OR liquidation (detected via REST poll)
+        AND RSI <= 50 (neutral-to-oversold close confirms the bounce)
+Exit:   TP hit (client-side high >= entry * (1 + tp_pct))
+        OR trail stop: low <= highest_high * (1 - trail_pct)  [Jason McIntosh; priority 1]
+        OR take-profit: high >= entry * (1 + tp_pct)          [priority 2]
+        OR stop-loss: low <= entry * (1 - sl_pct)             [hard floor; priority 3]
+        OR band exit: high drops below premium_k band (mirrors entry logic)
 """
 
 import pandas as pd
@@ -40,7 +41,7 @@ from ..utils.constants import (
     SIGNAL_DROUGHT_HOURS,
     MAX_LOSS_PCT,
     CANDLE_INTERVALS,
-    PAPER_SYMBOLS,
+    SYMBOLS,
 )
 from ..utils import constants as _C
 from ..utils.data_structures import RealPosition, PendingSignal, EntryParams, ExitParams, MC_MIN_TRADES, MC_SIMS
@@ -56,7 +57,6 @@ from ..core.indicators import (
     compute_exit_signals_raw,
 )
 from ..trading.bybit_client import BybitPrivateClient, fetch_last_klines, fetch_mark_klines, fetch_risk_tiers, get_instrument_info
-from ..trading.liquidation import pick_risk_tier
 from ..backtest.backtester import run_monte_carlo, mc_score
 from ..utils.plotting import print_monte_carlo_report
 from ..optimize.optimizer import optimise_params
@@ -130,6 +130,7 @@ class LiveRealTrader:
         self._reopt_running: bool = False  # guard against concurrent reopt threads
         self._time_tp_applied: bool = False  # True once 12h TP tightening fires
         self._shadow_positions: list = []  # virtual "what if" trades for gate-blocked signals
+        self._highest_high: float = 0.0   # McIntosh trail — highest candle-high since entry
         self._traders_ref: Optional[Dict] = None  # set by caller; used for interval-switching at re-opt
 
         self._recompute_indicators()
@@ -173,8 +174,8 @@ class LiveRealTrader:
     def _format_price(self, raw_price: float) -> float:
         """Round raw_price down to the instrument's tick size (priceFilter.tickSize).
 
-        Uses floor (not round) so a SHORT TP is always set at or below the
-        intended level rather than above it."""
+        Uses floor (not round) so a LONG TP is always set at or below the
+        intended level, avoiding overfill."""
         pf       = self.instrument.get("priceFilter", {})
         tick_str = str(pf.get("tickSize", "0.0001") or "0.0001")
         try:
@@ -249,7 +250,7 @@ class LiveRealTrader:
     # ── Entry execution ────────────────────────────────────────────────────────
 
     def _execute_entry(self, close_price: float, ts_utc: str, bar_ts: pd.Timestamp):
-        """Place a market SHORT entry order."""
+        """Place a market LONG (Buy) entry order."""
         if self.position is not None:
             log.warning(f"[{ts_utc}] Cannot enter — already in position")
             _db.log_event(ts_utc=ts_utc, level="INFO", event_type="ENTRY_SKIPPED",
@@ -279,28 +280,28 @@ class LiveRealTrader:
         wallet_before = self.wallet
         qty = 0.0
         try:
-            max_margin = self.wallet * float(MAX_SYMBOL_FRACTION)
-            qty        = self._format_qty((max_margin * float(self.leverage)) / c)
+            max_notional = self.wallet * float(MAX_SYMBOL_FRACTION)
+            qty          = self._format_qty(max_notional / c)
             self._ensure_entry_risk_checks(qty, c, wallet_before)
 
-            log_order(ts_utc=ts_utc, symbol=self.symbol, side="SHORT",
+            log_order(ts_utc=ts_utc, symbol=self.symbol, side="LONG",
                       qty=qty, price=c, order_type="ENTRY", status="PLACED",
                       reason="BAND_ENTRY")
 
-            order_id = self.client.place_market_order(self.symbol, "Sell", qty, reduce_only=False)
+            order_id = self.client.place_market_order(self.symbol, "Buy", qty, reduce_only=False)
             if self.last_signal:
                 self.last_signal["placed"] = True
             self._refresh_state()
             summary = self.client.get_execution_summary(self.symbol, order_id)
 
             if summary is None:
-                log_order(ts_utc=ts_utc, symbol=self.symbol, side="SHORT",
+                log_order(ts_utc=ts_utc, symbol=self.symbol, side="LONG",
                           qty=qty, price=c, order_type="ENTRY", status="FAILED",
                           order_id=order_id, error="No execution summary")
                 _db.log_event(ts_utc=ts_utc, level="ERROR", event_type="ORDER_NO_SUMMARY",
                     symbol=self.symbol,
                     message=f"Entry order {order_id} placed but execution summary missing — gate released",
-                    detail={"order_id": order_id, "side": "SHORT", "qty": qty,
+                    detail={"order_id": order_id, "side": "LONG", "qty": qty,
                             "price": c, "wallet_before": wallet_before})
                 self.gate.release(self.symbol)
                 return
@@ -313,48 +314,40 @@ class LiveRealTrader:
                 self.last_signal["filled"] = True
                 self.last_signal["price"]  = fill_price
 
-            # Compute TP using tick-size rounding (not arbitrary 8 dp).
-            # LIVE_TP_SCALE shrinks the distance so the live order sits closer
-            # to the fill price and is more reliably triggered than in backtests.
-            tp_price = self._format_price(fill_price * (1.0 - float(self.exit_params.tp_pct) * LIVE_TP_SCALE))
+            # Compute TP (LONG: price must rise). LIVE_TP_SCALE kept for compat.
+            tp_price = self._format_price(fill_price * (1.0 + float(self.exit_params.tp_pct) * LIVE_TP_SCALE))
 
             # Record entry state and write all logs BEFORE the TP call.
-            # If set_trading_stop raises (wrong precision, API error, Unified
-            # account mode mismatch, etc.) the entry is still fully recorded
-            # and indicator / time exits will close the position as fallback.
             self._entry_time      = bar_ts
             self._entry_price     = fill_price
             self._wallet_at_entry = wallet_before
+            self._highest_high    = fill_price   # start trail at entry fill price
 
             log.info(
-                f"{COLOR_SUBMITTED}[{ts_utc}] SHORT ENTRY FILLED: "
+                f"{COLOR_SUBMITTED}[{ts_utc}] LONG ENTRY FILLED: "
                 f"qty={filled_qty:.6f} fill={fill_price:.8f} "
-                f"TP={tp_price} ({(1.0 - tp_price/fill_price)*100:.2f}%){COLOR_RESET}"
+                f"TP={tp_price} ({(tp_price/fill_price - 1.0)*100:.2f}%){COLOR_RESET}"
             )
-            log_order(ts_utc=ts_utc, symbol=self.symbol, side="SHORT",
+            log_order(ts_utc=ts_utc, symbol=self.symbol, side="LONG",
                       qty=filled_qty, price=fill_price,
                       order_type="ENTRY", status="FILLED",
                       order_id=order_id, reason="BAND_ENTRY")
 
             self._log_real_trade(
                 ts_utc=ts_utc, action="ENTRY", reason="BAND_ENTRY",
-                side="SHORT", qty=filled_qty, fill_price=fill_price,
+                side="LONG", qty=filled_qty, fill_price=fill_price,
                 entry_price=fill_price, wallet_before=wallet_before,
                 wallet_after=self.wallet,
             )
 
-            # Set server-side TP in its own isolated try/except so a Bybit
-            # rejection does NOT release the gate or abort the entry sequence.
+            # set_trading_stop is a no-op for spot (handled in bybit_client.py)
             try:
                 self.client.set_trading_stop(self.symbol, tp_price)
             except Exception as tp_err:
-                log.warning(
-                    f"[{ts_utc}] Failed to set server-side TP: {tp_err} — "
-                    f"indicator/time exits will still close the position"
-                )
+                log.warning(f"[{ts_utc}] set_trading_stop skipped: {tp_err}")
 
         except Exception as e:
-            log_order(ts_utc=ts_utc, symbol=self.symbol, side="SHORT",
+            log_order(ts_utc=ts_utc, symbol=self.symbol, side="LONG",
                       qty=qty, price=c, order_type="ENTRY", status="FAILED", error=str(e))
             self.gate.release(self.symbol)
             log.error(f"[{ts_utc}] Entry failed: {e}")
@@ -373,7 +366,7 @@ class LiveRealTrader:
     # ── Exit execution ─────────────────────────────────────────────────────────
 
     def _execute_exit(self, close_price: float, reason: str, ts_utc: str):
-        """Place a market Buy to close the SHORT position."""
+        """Place a market Sell to close the LONG position."""
         if self.position is None:
             return
         pos          = self.position
@@ -383,17 +376,17 @@ class LiveRealTrader:
         qty_to_close  = 0.0
         try:
             qty_to_close = self._format_qty(qty_abs)
-            log_order(ts_utc=ts_utc, symbol=self.symbol, side="SHORT",
+            log_order(ts_utc=ts_utc, symbol=self.symbol, side="LONG",
                       qty=qty_to_close, price=close_price,
                       order_type="EXIT", status="PLACED", reason=reason)
 
-            order_id = self.client.place_market_order(self.symbol, "Buy", qty_to_close, reduce_only=True)
+            order_id = self.client.place_market_order(self.symbol, "Sell", qty_to_close, reduce_only=False)
             if self.last_signal:
                 self.last_signal["placed"] = True
             self._refresh_state()
             summary = self.client.get_execution_summary(self.symbol, order_id)
             if summary is None:
-                log_order(ts_utc=ts_utc, symbol=self.symbol, side="SHORT",
+                log_order(ts_utc=ts_utc, symbol=self.symbol, side="LONG",
                           qty=qty_to_close, price=close_price,
                           order_type="EXIT", status="FAILED",
                           order_id=order_id, error="No execution summary")
@@ -411,13 +404,13 @@ class LiveRealTrader:
             if self.last_signal:
                 self.last_signal["filled"] = True
                 self.last_signal["price"]  = fill_price
-            log_order(ts_utc=ts_utc, symbol=self.symbol, side="SHORT",
+            log_order(ts_utc=ts_utc, symbol=self.symbol, side="LONG",
                       qty=filled_qty, price=fill_price,
                       order_type="EXIT", status="FILLED",
                       order_id=order_id, reason=reason)
             self._log_real_trade(
                 ts_utc=ts_utc, action="EXIT", reason=reason,
-                side="COVER", qty=filled_qty, fill_price=fill_price,
+                side="SELL", qty=filled_qty, fill_price=fill_price,
                 entry_price=entry_price, wallet_before=wallet_before,
                 wallet_after=self.wallet,
             )
@@ -426,8 +419,9 @@ class LiveRealTrader:
             self._wallet_at_entry = None
             self._last_entry_fee  = 0.0
             self._time_tp_applied = False
+            self._highest_high    = 0.0
         except Exception as e:
-            log_order(ts_utc=ts_utc, symbol=self.symbol, side="SHORT",
+            log_order(ts_utc=ts_utc, symbol=self.symbol, side="LONG",
                       qty=qty_to_close if qty_to_close else qty_abs,
                       price=close_price, order_type="EXIT", status="FAILED", error=str(e))
             log.error(f"[{ts_utc}] Exit order failed: {e}")
@@ -452,7 +446,7 @@ class LiveRealTrader:
 
     def _handle_external_close(self, ts_utc: str, current_close: float):
         """Called when the bot detects that a position was closed outside its own
-        _execute_exit path — e.g. a server-side TP hit, a liquidation, or a manual
+        _execute_exit path — e.g. a server-side TP hit or a manual
         close via the Bybit app or web UI.
 
         Fetches the actual exit price / qty from Bybit's closed-pnl endpoint,
@@ -483,7 +477,7 @@ class LiveRealTrader:
             try:
                 self._log_real_trade(
                     ts_utc=ts_utc, action="EXIT", reason="EXTERNAL_CLOSE",
-                    side="COVER", qty=qty_abs, fill_price=exit_price,
+                    side="SELL", qty=qty_abs, fill_price=exit_price,
                     entry_price=entry_price, wallet_before=wallet_before,
                     wallet_after=self.wallet,
                 )
@@ -508,6 +502,7 @@ class LiveRealTrader:
         self._wallet_at_entry = None
         self._last_entry_fee  = 0.0
         self._time_tp_applied = False
+        self._highest_high    = 0.0
 
     # ── Trade log ──────────────────────────────────────────────────────────────
 
@@ -523,19 +518,19 @@ class LiveRealTrader:
         wallet_before: float,
         wallet_after: float,
     ):
-        if side == "COVER":
-            pnl_gross = (entry_price - fill_price) * qty
+        if side == "SELL":
+            pnl_gross = (fill_price - entry_price) * qty
         else:
             pnl_gross = 0.0
         fee_rate   = self.taker_fee
         fee        = (qty * fill_price) * float(fee_rate)
         # For exits subtract both the exit fee AND the stored entry fee.
         # For entries pnl_gross is 0 so pnl_net is just the negative entry fee.
-        if side == "COVER":
+        if side == "SELL":
             pnl_net = pnl_gross - fee - self._last_entry_fee
         else:
             pnl_net = pnl_gross - fee
-        tp_price   = entry_price * (1.0 - float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
+        tp_price   = entry_price * (1.0 + float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
 
         result = ""
         if action == "EXIT":
@@ -545,7 +540,7 @@ class LiveRealTrader:
             self.realized_pnl_net += pnl_net
             result = "WIN" if win else "LOSS"
 
-        pnl_1x   = float(pnl_net / float(self.leverage)) if self.leverage else 0.0
+        pnl_1x   = float(pnl_net)  # no leverage for spot
         pnl_pct_val = float(pnl_net / wallet_before * 100.0) if wallet_before > 0 else 0.0
         _db.log_trade(
             ts_utc=ts_utc, mode="live", symbol=self.symbol, interval=self.interval,
@@ -599,7 +594,7 @@ class LiveRealTrader:
         wr  = (self.win_count / self.trade_count * 100) if self.trade_count > 0 else 0.0
 
         if entry_sig:
-            sig_str = "** SHORT ENTRY **"
+            sig_str = "** LONG ENTRY **"
             sig_col = COLOR_ENTRY
         elif exit_sig:
             sig_str = "** EXIT SIGNAL **"
@@ -614,7 +609,7 @@ class LiveRealTrader:
             f"[{ts_utc}]  {self.symbol} #{self.closed_candle_count} {self.interval}m  "
             f"C={c:.5f}  |  "
             f"ADX={adx:.1f}(<{self.entry_params.adx_threshold:.0f})  "
-            f"RSI={rsi:.1f}(>={self.entry_params.rsi_neutral_lo:.0f})  "
+            f"RSI={rsi:.1f}(<={self.entry_params.rsi_neutral_lo:.0f})  "
             f"TP={xp.tp_pct*100:.3f}%  |  "
             f"{sig_col}{sig_str}{COLOR_RESET}  |  "
             f"W={self.win_count} L={self.trade_count - self.win_count} WR={wr:.0f}%  "
@@ -626,10 +621,10 @@ class LiveRealTrader:
         if self.position is not None:
             pos     = self.position
             qty_abs = abs(pos.qty)
-            upnl    = (pos.entry_price - self.mark_price) * qty_abs
-            margin  = pos.entry_price * qty_abs / float(self.leverage)
-            upnl_pct = (upnl / margin * 100) if margin > 0 else 0.0
-            tp_disp = pos.entry_price * (1.0 - float(xp.tp_pct) * LIVE_TP_SCALE)
+            upnl    = (self.mark_price - pos.entry_price) * qty_abs
+            notional = pos.entry_price * qty_abs
+            upnl_pct = (upnl / notional * 100) if notional > 0 else 0.0
+            tp_disp = pos.entry_price * (1.0 + float(xp.tp_pct) * LIVE_TP_SCALE)
             sign    = "+" if upnl >= 0 else ""
             days_held = ""
             if self._entry_time is not None:
@@ -639,7 +634,7 @@ class LiveRealTrader:
                 except Exception:
                     pass
             log.info(
-                f"  SHORT  entry=${pos.entry_price:.5f}  tp=${tp_disp:.5f}  "
+                f"  LONG  entry=${pos.entry_price:.5f}  tp=${tp_disp:.5f}  "
                 f"mark=${self.mark_price:.5f}  qty={qty_abs:.4f}  "
                 f"uPnL=${sign}{upnl:.4f} ({sign}{upnl_pct:.2f}%){days_held}"
             )
@@ -664,13 +659,13 @@ class LiveRealTrader:
         ).start()
 
     def _run_reoptimise(self):
-        """Background thread: scan ALL PAPER_SYMBOLS × CANDLE_INTERVALS and switch
+        """Background thread: scan ALL SYMBOLS × CANDLE_INTERVALS and switch
         to whichever (symbol, interval) pair scores best.
 
         Symbol switching is allowed only when flat (no open position) so we never
         abandon a live trade mid-flight.  Interval-only switches can always happen.
         """
-        log.info(f"[REOPT] starting multi-symbol optimisation scan ({PAPER_SYMBOLS})...")
+        log.info(f"[REOPT] starting multi-symbol optimisation scan ({SYMBOLS})...")
         try:
             best_score   = float("-inf")
             best_sym     = self.symbol
@@ -682,7 +677,7 @@ class LiveRealTrader:
             best_risk_df = None
             best_inst    = None
 
-            for sym in PAPER_SYMBOLS:
+            for sym in SYMBOLS:
                 # Fetch risk tiers + instrument info for every candidate symbol
                 try:
                     risk_df = fetch_risk_tiers(sym)
@@ -845,11 +840,6 @@ class LiveRealTrader:
                 self.entry_params = best_entry
                 self.exit_params  = best_exit_p
                 self.leverage     = best_exit_p.leverage
-                try:
-                    lev_int = int(best_exit_p.leverage)
-                    self.client.set_leverage(self.symbol, lev_int, lev_int)
-                except Exception as _lev_err:
-                    log.warning(f"[REOPT] set_leverage failed: {_lev_err}")
                 self._recompute_indicators()
                 # Seed analytics for full historical DataFrame so chart shows bands immediately
                 try:
@@ -907,9 +897,11 @@ class LiveRealTrader:
           1. Append candle to DataFrame, rebuild indicators
           2. Refresh wallet/position state from Bybit REST
           3. Skip if not enough candles for warm-up
-          4. Detect externally-closed position (server TP or liquidation)
-          5. Check stop-loss (high >= entry * (1 + sl_pct))               [priority 3]
-          8. Check band exit (low drops below discount_k band — mirrors entry logic) [priority 5]
+          4. Detect externally-closed position (server TP or manual close)
+          5. Trail stop  (low <= highest_high * (1 - trail_pct))           [priority 1]
+          6. Take-profit (high >= entry * (1 + tp_pct))                   [priority 2]
+          7. Stop-loss   (low <= entry * (1 - sl_pct))                    [priority 3]
+          8. Band exit   (high drops below premium_k band)                [priority 4]
           9. Check entry signal (band crossover AND ADX gate AND RSI gate)
          10. Log candle-close summary
         """
@@ -983,7 +975,7 @@ class LiveRealTrader:
             # place an entry on the same candle we just closed a position.
             acted = False
 
-            # ── Detect externally-closed position (server TP, liquidation, or manual close) ──
+            # ── Detect externally-closed position (server TP or manual close) ──
             # _entry_price is set whenever we are tracking an open position (whether entered
             # this session or detected at startup).  If position is now gone but we were
             # tracking one, the close happened outside _execute_exit — handle it properly.
@@ -1005,25 +997,25 @@ class LiveRealTrader:
             prev = self.df.iloc[-2]
 
             adx_val = float(row["adx"])
-            rsi_val = float(row["rsi"]) if not pd.isna(row["rsi"]) else 100.0
+            rsi_val = float(row["rsi"]) if not pd.isna(row["rsi"]) else 0.0
 
-            _raw_short = compute_entry_signals_raw(
+            _raw_long = compute_entry_signals_raw(
                 current_row=row, prev_row=prev,
-                current_high=h,
+                current_low=l,
             )
             # ── Signal drought tracking ──────────────────────────────────────────
-            if _raw_short > 0:
+            if _raw_long > 0:
                 self._last_signal_ts = time.time()
 
-            _final_short = resolve_entry_signals(
-                _raw_short, adx_val, rsi_val,
+            _final_long = resolve_entry_signals(
+                _raw_long, adx_val, rsi_val,
                 adx_threshold=self.entry_params.adx_threshold,
                 rsi_neutral_lo=self.entry_params.rsi_neutral_lo,
             )
-            entry_sig = _final_short > 0
+            entry_sig = _final_long > 0
             _raw_exit = compute_exit_signals_raw(
                 current_row=row, prev_row=prev,
-                current_low=l,
+                current_high=h,
             )
             exit_sig = _raw_exit > 0
 
@@ -1050,16 +1042,16 @@ class LiveRealTrader:
                     _sh["candles"] += 1
                     _sh_outcome = None
                     _sh_out_px  = None
-                    if l <= _sh["tp_price"]:
+                    if h >= _sh["tp_price"]:
                         _sh_outcome = "TP_HIT";   _sh_out_px = _sh["tp_price"]
-                    elif h >= _sh["sl_price"]:
+                    elif l <= _sh["sl_price"]:
                         _sh_outcome = "SL_HIT";   _sh_out_px = _sh["sl_price"]
                     elif _sh["candles"] >= 100:
                         _sh_outcome = "EXPIRED"
                     if _sh_outcome:
                         if _sh_outcome != "EXPIRED":
-                            _sh_pnl = ((_sh["entry_price"] - _sh_out_px)
-                                       / _sh["entry_price"] * float(self.leverage) * 100.0)
+                            _sh_pnl = ((_sh_out_px - _sh["entry_price"])
+                                       / _sh["entry_price"] * 100.0)
                             _db.log_missed_trade(
                                 entry_ts=_sh["entry_ts"], resolved_ts=ts_utc,
                                 symbol=self.symbol, interval=self.interval,
@@ -1095,7 +1087,7 @@ class LiveRealTrader:
 
             # ── DB: signal ──
             _sl_price_lvl = (
-                self._entry_price * (1.0 + float(self.exit_params.sl_pct))
+                self._entry_price * (1.0 - float(self.exit_params.sl_pct))
                 if self.position is not None and self._entry_price is not None else None
             )
 
@@ -1105,23 +1097,23 @@ class LiveRealTrader:
             elif _raw_exit > 0:
                 _sig_type = "EXIT_BAND"
                 _blocked  = None
-            elif _sl_price_lvl is not None and h >= _sl_price_lvl:
+            elif _sl_price_lvl is not None and l <= _sl_price_lvl:
                 _sig_type = "EXIT_SL"
                 _blocked  = None
             else:
                 _sig_type = "NONE"
                 _blocked  = None
-                if _raw_short > 0 and _final_short == 0:
-                    _blocked = "ADX" if adx_val >= 25 else "RSI"
+                if _raw_long > 0 and _final_long == 0:
+                    _blocked = "ADX" if adx_val >= self.entry_params.adx_threshold else "RSI"
                     # ── Shadow for indicator-blocked signal ───────────────────────
                     if self.position is None and len(self._shadow_positions) < 5:
                         _sh_ep = c
-                        _sh_tp = _sh_ep * (1.0 - float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
-                        _sh_sl = _sh_ep * (1.0 + float(self.exit_params.sl_pct))
+                        _sh_tp = _sh_ep * (1.0 + float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
+                        _sh_sl = _sh_ep * (1.0 - float(self.exit_params.sl_pct))
                         self._shadow_positions.append({
                             "entry_ts": ts_utc, "entry_price": _sh_ep,
                             "tp_price": _sh_tp, "sl_price": _sh_sl,
-                            "band": _raw_short, "blocked_by": _blocked,
+                            "band": _raw_long, "blocked_by": _blocked,
                             "candles": 0, "adx_at_entry": adx_val,
                             "rsi_at_entry": rsi_val,
                         })
@@ -1129,7 +1121,7 @@ class LiveRealTrader:
             _db.log_signal(
                 ts_utc=ts_utc, symbol=self.symbol, interval=self.interval,
                 signal_type=_sig_type,
-                raw_band_level=_raw_short, final_band_level=_final_short,
+                raw_band_level=_raw_long, final_band_level=_final_long,
                 adx=adx_val, rsi=rsi_val,
                 sl_price_level=_sl_price_lvl,
                 blocked_by=_blocked,
@@ -1142,16 +1134,16 @@ class LiveRealTrader:
             # ── DB: position snapshot ──
             if self.position is not None:
                 _qty_abs  = abs(self.position.qty)
-                _upnl     = (self.position.entry_price - self.mark_price) * _qty_abs
+                _upnl     = (self.mark_price - self.position.entry_price) * _qty_abs
                 _ts_entry = self._entry_time.strftime("%Y-%m-%d %H:%M:%S") if self._entry_time else None
-                _tp_snap  = self._entry_price * (1.0 - float(self.exit_params.tp_pct) * _C.LIVE_TP_SCALE) if self._entry_price else None
+                _tp_snap  = self._entry_price * (1.0 + float(self.exit_params.tp_pct) * _C.LIVE_TP_SCALE) if self._entry_price else None
                 _db.log_position(
                     ts_utc=ts_utc, symbol=self.symbol,
-                    qty=-_qty_abs,
+                    qty=_qty_abs,
                     entry_price=self.position.entry_price,
                     entry_time=_ts_entry,
                     mark_price=self.mark_price,
-                    liquidation_price=self.position.liq_price,
+                    liquidation_price=None,
                     unrealized_pnl=_upnl,
                     min_low_since_entry=None,
                     sl_price=_sl_price_lvl,
@@ -1185,7 +1177,7 @@ class LiveRealTrader:
                             scale=TIME_TP_SCALE,
                         )
                         new_tp = self._format_price(
-                            self.position.entry_price * (1.0 - _dyn_tp_pct)
+                            self.position.entry_price * (1.0 + _dyn_tp_pct)
                         )
                         self.client.set_trading_stop(self.symbol, new_tp)
                         self._time_tp_applied = True
@@ -1208,17 +1200,36 @@ class LiveRealTrader:
                 except Exception as _ttp_err:
                     log.warning(f"[{ts_utc}] Time-based TP update failed: {_ttp_err}")
 
-            # ── Hard stop-loss signal ──
+            # Update McIntosh trailing stop tracker — never moves down
+            if self.position is not None:
+                self._highest_high = max(self._highest_high, h)
+
+            # ── Trailing stop (Jason McIntosh — trail below highest high since entry) ──
+            if not acted and self.position is not None and self._entry_price is not None:
+                if self.exit_params.trail_pct > 0 and self._highest_high > 0:
+                    trail_price = self._highest_high * (1.0 - float(self.exit_params.trail_pct))
+                    if l <= trail_price:
+                        self._execute_exit(trail_price, "TRAIL_STOP", ts_utc)
+                        acted = True
+
+            # ── Take-profit check (LONG: high >= tp_price, client-side for spot) ──
+            if not acted and self.position is not None and self._entry_price is not None:
+                tp_price_lvl = self._entry_price * (1.0 + float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
+                if h >= tp_price_lvl:
+                    self._execute_exit(tp_price_lvl, "TP", ts_utc)
+                    acted = True
+
+            # ── Hard stop-loss signal (LONG: low drops below sl_price) ──
             sl_exit = False
             if self.position is not None and self._entry_price is not None:
-                sl_price = self._entry_price * (1.0 + float(self.exit_params.sl_pct))
-                if h >= sl_price:
+                sl_price = self._entry_price * (1.0 - float(self.exit_params.sl_pct))
+                if l <= sl_price:
                     sl_exit = True
 
             if entry_sig:
-                self.last_signal = {"type": "ENTRY", "time": ts_utc, "placed": False, "filled": False, "price": None, "band": _raw_short}
+                self.last_signal = {"type": "ENTRY", "time": ts_utc, "placed": False, "filled": False, "price": None, "band": _raw_long}
             elif exit_sig or sl_exit:
-                self.last_signal = {"type": "EXIT",  "time": ts_utc, "placed": False, "filled": False, "price": None, "band": _raw_short}
+                self.last_signal = {"type": "EXIT",  "time": ts_utc, "placed": False, "filled": False, "price": None, "band": _raw_long}
 
             # ── Stop-loss exit ──  (priority 3, matches backtester)
             if not acted and sl_exit and self.position is not None:
@@ -1235,10 +1246,17 @@ class LiveRealTrader:
                 if self.wallet >= MIN_WALLET_USDT:
                     self._execute_entry(c, ts_utc, ts)
                     # ── Same-bar exit — "Recalculate: After order is filled" (TradingView) ──
-                    # For live trading, TP and liq are server-side; re-check SL and band exit only.
+                    # Re-check TP, trail stop, SL, and band exit on the entry bar.
                     if self.position is not None and self._entry_price is not None:
-                        _sl_sb = self._entry_price * (1.0 + float(self.exit_params.sl_pct))
-                        if h >= _sl_sb:
+                        _sb_tp = self._entry_price * (1.0 + float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
+                        _sb_hh = max(self._highest_high, h)
+                        _sb_trail = _sb_hh * (1.0 - float(self.exit_params.trail_pct)) if self.exit_params.trail_pct > 0 else None
+                        _sl_sb = self._entry_price * (1.0 - float(self.exit_params.sl_pct))
+                        if _sb_trail is not None and l <= _sb_trail:
+                            self._execute_exit(_sb_trail, "TRAIL_STOP", ts_utc)
+                        elif h >= _sb_tp:
+                            self._execute_exit(_sb_tp, "TP", ts_utc)
+                        elif l <= _sl_sb:
                             self._execute_exit(c, "STOP_LOSS", ts_utc)
                         elif exit_sig:
                             self._execute_exit(c, "BAND_EXIT", ts_utc)
@@ -1247,26 +1265,26 @@ class LiveRealTrader:
                     # ── Shadow for wallet-blocked signal ─────────────────────────
                     if len(self._shadow_positions) < 5:
                         _sh_ep = c
-                        _sh_tp = _sh_ep * (1.0 - float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
-                        _sh_sl = _sh_ep * (1.0 + float(self.exit_params.sl_pct))
+                        _sh_tp = _sh_ep * (1.0 + float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
+                        _sh_sl = _sh_ep * (1.0 - float(self.exit_params.sl_pct))
                         self._shadow_positions.append({
                             "entry_ts": ts_utc, "entry_price": _sh_ep,
                             "tp_price": _sh_tp, "sl_price": _sh_sl,
-                            "band": _raw_short, "blocked_by": "WALLET",
+                            "band": _raw_long, "blocked_by": "WALLET",
                             "candles": 0, "adx_at_entry": adx_val,
                             "rsi_at_entry": rsi_val,
                         })
             elif entry_sig and self.position is not None:
-                log.info(f"[{ts_utc}] Entry signal — already SHORT (no pyramiding)")
+                log.info(f"[{ts_utc}] Entry signal — already LONG (no pyramiding)")
                 # ── Shadow for position-blocked signal ───────────────────────────
                 if len(self._shadow_positions) < 5:
                     _sh_ep = c
-                    _sh_tp = _sh_ep * (1.0 - float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
-                    _sh_sl = _sh_ep * (1.0 + float(self.exit_params.sl_pct))
+                    _sh_tp = _sh_ep * (1.0 + float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
+                    _sh_sl = _sh_ep * (1.0 - float(self.exit_params.sl_pct))
                     self._shadow_positions.append({
                         "entry_ts": ts_utc, "entry_price": _sh_ep,
                         "tp_price": _sh_tp, "sl_price": _sh_sl,
-                        "band": _raw_short, "blocked_by": "POSITION",
+                        "band": _raw_long, "blocked_by": "POSITION",
                         "candles": 0, "adx_at_entry": adx_val,
                         "rsi_at_entry": rsi_val,
                     })
@@ -1304,7 +1322,8 @@ def start_live_ws(
     Reconnects automatically on disconnect.
     Press Ctrl+C to stop, or set stop_event (threading.Event) to stop programmatically.
     """
-    ws_url  = "wss://stream.bybit.com/v5/public/linear"
+    from ..utils.constants import CATEGORY as _CATEGORY
+    ws_url  = f"wss://stream.bybit.com/v5/public/{'spot' if _CATEGORY == 'spot' else 'linear'}"
 
     # Subscribe to every configured (interval, symbol) pair so re-opt can switch
     # interval dynamically without needing a WS reconnect.
@@ -1377,7 +1396,8 @@ def start_live_ws(
         if topic in topic_t_set and data:
             d = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else None)
             if d:
-                mp = d.get("markPrice")
+                # For spot: use lastPrice; for linear: use markPrice
+                mp = d.get("markPrice") or d.get("lastPrice")
                 if mp is not None:
                     ts_utc = pd.Timestamp.utcnow().strftime("%Y-%m-%d %H:%M:%S")
                     trader.on_mark_price_update(float(mp), ts_utc)

@@ -80,13 +80,7 @@ def _load_config() -> Optional[dict]:
 
 
 def _apply_config(cfg: dict) -> None:
-    """Apply non-symbol config values at bot-run time.
-
-    The "symbol" key is not applied here — C.SYMBOLS / C.PAPER_SYMBOLS are
-    seeded once in App.__init__ from the config file and then stay fixed for
-    the duration of the bot run.  The market-analyst agent is the sole
-    authority for choosing which symbol to trade.
-    """
+    """Apply non-symbol config values at bot-run time."""
     if not cfg:
         return
     # NOTE: "symbol" key is intentionally NOT applied here — seeded at init.
@@ -99,7 +93,7 @@ def _apply_config(cfg: dict) -> None:
         xc = cfg["exit"]
         if "tp_pct"       in xc: C.DEFAULT_TP_PCT       = float(xc["tp_pct"])
     if "days_back_seed"   in cfg: C.DAYS_BACK_SEED      = int(cfg["days_back_seed"])
-    C.CANDLE_INTERVALS = ["15"]   # fixed — 15m only
+    C.CANDLE_INTERVALS = ["5"]    # fixed — 5m only
     if "risk_pct"         in cfg: C.MAX_SYMBOL_FRACTION  = float(cfg["risk_pct"])
     if "optimizer" in cfg:
         if "n_trials" in cfg["optimizer"]:
@@ -243,13 +237,13 @@ class _StatsPoller(threading.Thread):
                 p      = t.position
                 qty    = abs(p.qty)
                 mark   = t.mark_price
-                upnl   = (p.entry_price - mark) * qty
-                margin = p.entry_price * qty / float(t.leverage)
-                pct    = (upnl / margin * 100) if margin else 0.0
+                upnl   = (mark - p.entry_price) * qty
+                notional = p.entry_price * qty
+                pct    = (upnl / notional * 100) if notional else 0.0
                 pos_info = {
                     "symbol":      sym,
                     "entry_price": p.entry_price,
-                    "tp_price":    p.entry_price * (1.0 - t.exit_params.tp_pct * LIVE_TP_SCALE),
+                    "tp_price":    p.entry_price * (1.0 + t.exit_params.tp_pct * LIVE_TP_SCALE),
                     "mark_price":  mark,
                     "qty":         qty,
                     "upnl":        upnl,
@@ -430,9 +424,17 @@ class _BotController:
 
                     # Seed candle_analytics so /api/ready returns true after
                     # first optimisation — chart browser opener polls this table.
+                    # Must enrich df with indicators first so band columns are populated.
                     try:
+                        _df_ind = bot.build_indicators(
+                            df_last,
+                            ma_len=ep.ma_len, band_mult=ep.band_mult,
+                            exit_ma_len=xp.exit_ma_len, exit_band_mult=xp.exit_band_mult,
+                            band_ema_len=ep.band_ema_len,
+                            adx_period=ep.adx_period, rsi_period=ep.rsi_period,
+                        )
                         _db.bulk_log_seed_analytics(
-                            df=df_last, symbol=sym, interval=iv,
+                            df=_df_ind, symbol=sym, interval=iv,
                             ma_len=ep.ma_len, band_mult=ep.band_mult,
                             exit_ma_len=xp.exit_ma_len,
                             exit_band_mult=float(xp.exit_band_mult),
@@ -540,257 +542,7 @@ class _BotController:
             self._emit("done",)
 
 
-# ── Paper Bot Controller ──────────────────────────────────────────────────────
-class _PaperBotController:
-    """Owns the paper trading background thread.  No API keys required."""
 
-    def __init__(self, q: queue.Queue, stop_evt: threading.Event) -> None:
-        self._q       = q
-        self._stop    = stop_evt
-        self._poller: Optional[_StatsPoller] = None
-
-    def start(self) -> None:
-        self._stop.clear()
-        threading.Thread(target=self._run, daemon=True, name="paper-bot-main").start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._poller:
-            self._poller.stop()
-
-    def _emit(self, *msg: Any) -> None:
-        self._q.put(msg)
-
-    def _log(self, msg: str) -> None:
-        self._emit("log", msg)
-
-    def _run(self) -> None:
-        try:
-            self._emit("status", "initializing")
-            self._log("Starting paper trading session…")
-
-            cfg = _load_config()
-            if cfg:
-                _apply_config(cfg)
-
-            # Paper mode always scans the full set of test symbols.
-            # C.SYMBOLS tracks the best live symbol (from market-analyst);
-            # C.PAPER_SYMBOLS is the fixed multi-symbol scan list.
-            symbols   = C.PAPER_SYMBOLS
-            intervals = supported_intervals(C.CANDLE_INTERVALS)
-            # Paper mode: each symbol gets its own independent PositionGate so
-            # all four symbols can trade simultaneously without blocking each other.
-
-            n_pairs  = len(symbols) * len(intervals)
-            pair_idx = 0
-            results: Dict = {}
-
-            self._emit("agent",
-                       f"🤖  Agent analysis starting (PAPER) — {', '.join(symbols)}  "
-                       f"[{', '.join(intervals)}m]  ·  {C.INIT_TRIALS} trials each",
-                       "Initialising…")
-
-            for sym in symbols:
-                if self._stop.is_set():
-                    break
-                try:
-                    risk_df    = bot.fetch_risk_tiers(sym)
-                    instrument = bot.get_instrument_info(sym)
-                except Exception as exc:
-                    self._log(f"Skipping {sym}: {exc}")
-                    self._emit("agent", f"  ✗  {sym}: {exc}")
-                    continue
-
-                for iv in intervals:
-                    if self._stop.is_set():
-                        break
-                    try:
-                        pair_idx += 1
-                        self._log(f"Downloading market data for {sym}…")
-                        self._emit("agent",
-                                   f"  Downloading {sym} {iv}m seed data…",
-                                   f"Downloading {iv}m…")
-                        df_last, df_mark = bot.download_seed_history(sym, C.DAYS_BACK_SEED, iv)
-                        self._log(f"Market data ready ({len(df_last)} candles)")
-
-                        self._emit("status", "optimizing")
-                        self._emit("agent",
-                                   f"  Optimising {sym} {iv}m  ({len(df_last)} candles)  …",
-                                   f"Optimising {iv}m…")
-
-                        # warm-start from agent's saved params if fresh
-                        _saved = _load_agent_best_params(sym, iv)
-                        if _saved:
-                            self._emit("agent",
-                                       f"  ↳ Warm-starting from previous agent params  "
-                                       f"MA={_saved['ma_len']}  BM={_saved['band_mult']:.4f}%")
-
-                        def _make_cb(pidx: int, npairs: int, _sym: str, _iv: str) -> Any:
-                            _last = [-1]
-                            def cb(done: int, total: int) -> None:
-                                bucket = (done * 20) // total  # 0–20 (one per 5%)
-                                if bucket == _last[0] and done < total:
-                                    return
-                                _last[0] = bucket
-                                pct = min(100, bucket * 5)
-                                base = (pidx - 1) / npairs
-                                frac = (done / total) / npairs
-                                self._emit("progress", base + frac,
-                                           f"Analysing {_sym} {_iv}m… {pct}%")
-                            return cb
-
-                        opt = bot.optimise_bayesian(
-                            df_last=df_last,
-                            df_mark=df_mark,
-                            risk_df=risk_df,
-                            trials=C.INIT_TRIALS,
-                            lookback_candles=min(len(df_last), len(df_mark)),
-                            event_name=f"PAPER_INIT_{sym}_{iv}m",
-                            fee_rate=taker_fee_for(sym),
-                            maker_fee_rate=maker_fee_for(sym),
-                            interval_minutes=int(iv),
-                            saved_best=_saved,
-                            progress_callback=_make_cb(pair_idx, n_pairs, sym, iv),
-                            verbose=False,
-                        )
-
-                        ep = opt["entry_params"]
-                        xp = opt["exit_params"]
-                        br = opt["best_result"]
-                        pf = br.pnl_pct / (1.0 + max(br.max_drawdown_pct, 0.001))
-                        self._log("Market analysis complete.")
-                        self._emit("agent",
-                                   f"  {iv}m  →  MA={ep.ma_len}  BandMult={ep.band_mult:.2f}%  "
-                                   f"TP={xp.tp_pct*100:.3f}%  │  "
-                                   f"Trades={br.trades}  WR={br.winrate:.0f}%  "
-                                   f"PnL={br.pnl_pct:+.2f}%  Score={pf:.4f}")
-
-                        results[(sym, iv)] = {
-                            **opt,
-                            "df_last":    df_last,
-                            "df_mark":    df_mark,
-                            "risk_df":    risk_df,
-                            "instrument": instrument,
-                            "interval":   iv,
-                            "score":      pf,
-                        }
-
-                        # Seed candle_analytics so /api/ready returns true after
-                        # first optimisation — chart browser opener polls this table.
-                        try:
-                            _db.bulk_log_seed_analytics(
-                                df=df_last, symbol=sym, interval=iv,
-                                ma_len=ep.ma_len, band_mult=ep.band_mult,
-                                exit_ma_len=xp.exit_ma_len,
-                                exit_band_mult=float(xp.exit_band_mult),
-                                sl_pct=float(xp.sl_pct),
-                            )
-                        except Exception as _ana_err:
-                            self._log(f"[DB] bulk_log_seed_analytics: {_ana_err}")
-                        try:
-                            _db.bulk_log_backtest_trades(
-                                trade_records=getattr(br, "trade_records", []) or [],
-                                symbol=sym, interval=iv,
-                                entry_params=ep, exit_params=xp,
-                            )
-                        except Exception as _bt_err:
-                            self._log(f"[DB] bulk_log_backtest_trades: {_bt_err}")
-
-                    except Exception as exc:
-                        self._log(f"Skipping {sym} {iv}m: {exc}")
-                        self._emit("agent", f"  ✗  {sym} {iv}m: {exc}")
-
-            if self._stop.is_set():
-                self._emit("status", "idle")
-                self._log("Stopped by user.")
-                self._emit("done",)
-                return
-
-            if not results:
-                self._emit("status", "error")
-                self._log("No valid symbols found. Check network connection and symbol list.")
-                self._emit("done",)
-                return
-
-            # Paper mode: select the best interval per symbol for every symbol
-            # that passed the scan — no MAX_ACTIVE_SYMBOLS cap (paper = no real risk).
-            ranked   = sorted(results.items(), key=lambda x: x[1]["score"], reverse=True)
-            selected = []
-            seen: set = set()
-            for (sym, iv), d in ranked:
-                if sym not in seen:
-                    selected.append((sym, d))
-                    seen.add(sym)
-            # (all valid symbols, no limit)
-
-            if selected:
-                _sym, _d = selected[0]
-                _ep = _d["entry_params"]
-                _xp = _d["exit_params"]
-                _br = _d["best_result"]
-                _n_wins   = sum(1 for t in _br.trade_records if t.pnl_net > 0)
-                _n_losses = sum(1 for t in _br.trade_records if t.pnl_net < 0)
-                self._emit("agent",
-                           f"★  BEST: {_d['interval']}m  │  "
-                           f"MA={_ep.ma_len}  BandMult={_ep.band_mult:.2f}%  "
-                           f"TP={_xp.tp_pct*100:.3f}%  │  "
-                           f"Trades={_br.trades}  WR={_br.winrate:.0f}%  "
-                           f"PnL={_br.pnl_pct:+.2f}%  Score={_d['score']:.4f}",
-                           f"Best: {_d['interval']}m")
-                self._emit("best_params", {
-                    "symbol":         _sym,
-                    "interval":       _d["interval"],
-                    "leverage":       _xp.leverage,
-                    "ma_len":         _ep.ma_len,
-                    "band_mult":      _ep.band_mult,
-                    "tp_pct":         _xp.tp_pct * 100.0,
-                    "sl_pct":         _xp.sl_pct * 100.0,
-                    "exit_ma_len":    _xp.exit_ma_len,
-                    "exit_band_mult": _xp.exit_band_mult,
-                    "n_wins":         _n_wins,
-                    "n_losses":       _n_losses,
-                    "trades":         _br.trades,
-                    "winrate":        _br.winrate,
-                    "return_pct":     _br.pnl_pct,
-                    "sharpe":         _br.sharpe_ratio,
-                    "max_dd":         _br.max_drawdown_pct,
-                })
-
-            traders: Dict[str, Any] = {}
-            for sym, d in selected:
-                self._log(f"Initializing paper trader for {sym}…")
-                traders[sym] = bot.PaperTrader(
-                    symbol=sym,
-                    df_last_seed=d["df_last"],
-                    df_mark_seed=d["df_mark"],
-                    risk_df=d["risk_df"],
-                    entry_params=d["entry_params"],
-                    exit_params=d["exit_params"],
-                    gate=bot.PositionGate(),   # independent gate per symbol
-                    interval=d["interval"],
-                    instrument=d["instrument"],
-                )
-
-            self._poller = _StatsPoller(traders, self._q)
-            self._poller.start()
-
-            self._emit("status", "trading")
-            self._emit("progress", 1.0, "")
-            syms_str = ", ".join(traders.keys())
-            self._log(f"Paper trading active — {syms_str}  (virtual $500 USDT wallet)")
-            self._emit("agent",
-                       f"🟡  Paper trading — {syms_str}  │  Agent monitoring active",
-                       "Paper trading")
-
-            bot.start_live_ws(traders, stop_event=self._stop)
-
-        except Exception as exc:
-            self._emit("error", str(exc))
-            self._emit("status", "error")
-        finally:
-            if self._poller:
-                self._poller.stop()
-            self._emit("done",)
 
 
 # ── Main Application ──────────────────────────────────────────────────────────
@@ -800,7 +552,6 @@ class App(ctk.CTk):
         "initializing": ("#d29922", "● STARTING"),
         "optimizing":   ("#388bfd", "● ANALYZING"),
         "trading":      ("#3fb950", "● LIVE"),
-        "paper":        ("#58a6ff", "● PAPER"),
         "stopping":     ("#d29922", "● STOPPING"),
         "error":        ("#f85149", "● ERROR"),
     }
@@ -821,7 +572,6 @@ class App(ctk.CTk):
         self._stop_evt = threading.Event()
         self._ctrl: Optional[_BotController] = None
         self._running   = False
-        self._mode      = "LIVE"   # "LIVE" or "PAPER"
         self._api_open  = True
         self._risk_open = False  # Settings start collapsed
         # Line counters — used to trim textboxes and prevent slow inserts
@@ -836,11 +586,10 @@ class App(ctk.CTk):
 
         # Seed C.SYMBOLS from the config file so the live trader picks up
         # whichever symbol the market-analyst agent last identified as best.
-        # PAPER_SYMBOLS is always the full 4-symbol scan list from constants.py.
         _early_cfg = _load_config()
         if _early_cfg:
             if "symbol" in _early_cfg:
-                C.SYMBOLS = [_early_cfg["symbol"]]   # live only — paper scans all 4
+                C.SYMBOLS = [_early_cfg["symbol"]]
             if "starting_wallet" in _early_cfg: C.STARTING_WALLET  = float(_early_cfg["starting_wallet"])
 
         self._build_ui()
@@ -977,29 +726,10 @@ class App(ctk.CTk):
             self._risk_body, text="Testing Period:",
             font=ctk.CTkFont(size=13), text_color="#c9d1d9",
         ).grid(row=1, column=0, padx=(14, 8), pady=(0, 10), sticky="w")
-
-        _days_options = ["2 days", "3 days", "5 days", "7 days",
-                         "15 days", "30 days", "60 days", "90 days"]
-        self._days_var = ctk.StringVar(value=f"{C.DAYS_BACK_SEED} days")
-        self._days_menu = ctk.CTkOptionMenu(
-            self._risk_body,
-            values=_days_options,
-            variable=self._days_var,
-            width=90,
-        )
-        self._days_menu.grid(row=1, column=1, padx=(0, 8), pady=(0, 10))
-
-        self._btn_apply_days = ctk.CTkButton(
-            self._risk_body, text="Apply", width=80,
-            command=self._apply_days,
-        )
-        self._btn_apply_days.grid(row=1, column=2, padx=(0, 14), pady=(0, 10), sticky="w")
-
-        self._lbl_days_status = ctk.CTkLabel(
-            self._risk_body, text=f"Current: {C.DAYS_BACK_SEED} day(s) of history",
-            text_color="#8b949e", font=ctk.CTkFont(size=12),
-        )
-        self._lbl_days_status.grid(row=1, column=3, padx=14, pady=(0, 10), sticky="w")
+        ctk.CTkLabel(
+            self._risk_body, text="5 days  (fixed)",
+            font=ctk.CTkFont(size=13), text_color="#8b949e",
+        ).grid(row=1, column=1, padx=(0, 8), pady=(0, 10), sticky="w")
 
         ctk.CTkLabel(
             self._risk_body, text="Number of Tests:",
@@ -1034,7 +764,7 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=13), text_color="#c9d1d9",
         ).grid(row=3, column=0, padx=(14, 8), pady=(0, 12), sticky="w")
         ctk.CTkLabel(
-            self._risk_body, text="15m  (fixed)",
+            self._risk_body, text="5m  (fixed)",
             font=ctk.CTkFont(size=13), text_color="#8b949e",
         ).grid(row=3, column=1, padx=(0, 8), pady=(0, 12), sticky="w")
 
@@ -1043,32 +773,10 @@ class App(ctk.CTk):
             self._risk_body, text="Take Profit:",
             font=ctk.CTkFont(size=13), text_color="#c9d1d9",
         ).grid(row=5, column=0, padx=(14, 8), pady=(0, 12), sticky="w")
-
-        _tp_options = ["0.2%", "0.3%", "0.4%", "0.5%", "1.0%", "2.0%", "3.0%", "4.0%", "5.0%", "6.0%"]
-        _tp_default = f"{C.DEFAULT_TP_PCT * 100:.1f}%"
-        if _tp_default not in _tp_options:
-            _tp_default = "0.3%"
-        self._tp_var = ctk.StringVar(value=_tp_default)
-        self._tp_menu = ctk.CTkOptionMenu(
-            self._risk_body,
-            values=_tp_options,
-            variable=self._tp_var,
-            width=90,
-        )
-        self._tp_menu.grid(row=5, column=1, padx=(0, 8), pady=(0, 12))
-
-        self._btn_apply_tp = ctk.CTkButton(
-            self._risk_body, text="Apply", width=80,
-            command=self._apply_tp,
-        )
-        self._btn_apply_tp.grid(row=5, column=2, padx=(0, 14), pady=(0, 12), sticky="w")
-
-        self._lbl_tp_status = ctk.CTkLabel(
-            self._risk_body,
-            text=f"Current: {C.DEFAULT_TP_PCT * 100:.1f}%  (applied before analysis starts)",
-            text_color="#8b949e", font=ctk.CTkFont(size=12),
-        )
-        self._lbl_tp_status.grid(row=5, column=3, padx=14, pady=(0, 12), sticky="w")
+        ctk.CTkLabel(
+            self._risk_body, text="Optimised automatically",
+            font=ctk.CTkFont(size=13), text_color="#8b949e",
+        ).grid(row=5, column=1, columnspan=3, padx=(0, 14), pady=(0, 12), sticky="w")
 
 
         # ── Controls ──────────────────────────────────────────────────────────
@@ -1092,16 +800,6 @@ class App(ctk.CTk):
             command=self._stop_bot,
         )
         self._btn_stop.grid(row=0, column=1, padx=8, pady=12)
-
-        self._mode_seg = ctk.CTkSegmentedButton(
-            ctrl,
-            values=["LIVE", "PAPER"],
-            command=self._on_mode_change,
-            width=160,
-            font=ctk.CTkFont(size=13, weight="bold"),
-        )
-        self._mode_seg.set("LIVE")
-        self._mode_seg.grid(row=0, column=2, padx=8, pady=12)
 
         self._btn_chart = ctk.CTkButton(
             ctrl, text="📊  Chart", width=110, height=44,
@@ -1430,12 +1128,12 @@ class App(ctk.CTk):
             self._lbl_agent_phase.configure(text=last_phase)
         # Auto-switch tabs based on the last message in the batch
         last_text = msgs[-1][1] if msgs else ""
-        if last_text.startswith("🟢") or last_text.startswith("🟡"):
+        if last_text.startswith("🟢"):
             try:
                 self._bottom_tabs.set("Activity")
             except Exception:
                 pass
-        elif last_phase and not last_phase.startswith("Trading") and not last_phase.startswith("Paper"):
+        elif last_phase and not last_phase.startswith("Trading"):
             try:
                 self._bottom_tabs.set("🤖  Agent Analysis")
             except Exception:
@@ -1501,20 +1199,6 @@ class App(ctk.CTk):
             text_color="#3fb950",
         )
 
-    def _apply_days(self) -> None:
-        raw = self._days_var.get().replace("days", "").replace("day", "").strip()
-        try:
-            days = int(raw)
-        except ValueError:
-            return
-        days = max(1, days)
-        C.DAYS_BACK_SEED = days
-        _save_config({"days_back_seed": days})
-        self._lbl_days_status.configure(
-            text=f"Current: {days} day(s) of history",
-            text_color="#3fb950",
-        )
-
     def _apply_tests(self) -> None:
         try:
             n = int(self._tests_var.get().strip())
@@ -1530,44 +1214,18 @@ class App(ctk.CTk):
         )
 
 
-    def _apply_tp(self) -> None:
-        raw = self._tp_var.get().replace("%", "").strip()
-        try:
-            pct = float(raw)
-        except ValueError:
-            return
-        pct = round(max(0.1, min(6.0, pct)), 4)
-        C.DEFAULT_TP_PCT = pct / 100.0
-        # Persist so restart picks up the new value instead of reverting to config file.
-        _save_config({"exit": {"tp_pct": C.DEFAULT_TP_PCT}})
-        self._lbl_tp_status.configure(
-            text=f"Current: {pct:.1f}%  (applied before analysis starts)",
-            text_color="#3fb950",
-        )
-
-    # ── Mode toggle ───────────────────────────────────────────────────────────
-    def _on_mode_change(self, mode: str) -> None:
-        self._mode = mode
-        if mode == "PAPER":
-            self._lbl_ctrl_msg.configure(
-                text="Paper mode — no API keys required — press START"
-            )
-        else:
-            self._lbl_ctrl_msg.configure(text="Enter your API keys and press START")
-
     # ── Bot controls ──────────────────────────────────────────────────────────
     def _start_bot(self) -> None:
-        if self._mode == "LIVE":
-            k = self._ent_key.get().strip()
-            s = self._ent_secret.get().strip()
-            if not validate_api_credentials(k, s):
-                messagebox.showerror(
-                    "API Keys Required",
-                    "Please enter and save your Bybit API credentials before starting.",
-                )
-                return
-            C.API_KEY    = k
-            C.API_SECRET = s
+        k = self._ent_key.get().strip()
+        s = self._ent_secret.get().strip()
+        if not validate_api_credentials(k, s):
+            messagebox.showerror(
+                "API Keys Required",
+                "Please enter and save your Bybit API credentials before starting.",
+            )
+            return
+        C.API_KEY    = k
+        C.API_SECRET = s
 
         # ── Schema compliance check ────────────────────────────────────────────
         # Silently resets the database if the on-disk schema is out of date
@@ -1583,22 +1241,16 @@ class App(ctk.CTk):
 
         self._btn_start.configure(state="disabled")
         self._btn_stop.configure(state="normal")
-        self._mode_seg.configure(state="disabled")
         self._lbl_ctrl_msg.configure(text="Bot is starting up…")
         self._risk_menu.configure(state="disabled")
         self._btn_apply_risk.configure(state="disabled")
-        self._days_menu.configure(state="disabled")
-        self._btn_apply_days.configure(state="disabled")
         self._tests_menu.configure(state="disabled")
         self._btn_apply_tests.configure(state="disabled")
         self._prog_outer.grid()
         self._prog_bar.set(0)
 
         self._running = True
-        if self._mode == "PAPER":
-            self._ctrl = _PaperBotController(self._q, self._stop_evt)
-        else:
-            self._ctrl = _BotController(self._q, self._stop_evt)
+        self._ctrl = _BotController(self._q, self._stop_evt)
         self._ctrl.start()
         self._refresh_trades()
 
@@ -1714,16 +1366,10 @@ class App(ctk.CTk):
 
         elif kind == "status":
             self._set_status(msg[1])
-            _trading_msg = (
-                "Paper trading — monitoring market"
-                if self._mode == "PAPER"
-                else "Live trading — monitoring market"
-            )
             friendly = {
                 "initializing": "Starting up…",
                 "optimizing":   "Analyzing market conditions…",
-                "trading":      _trading_msg,
-                "paper":        "Paper trading — monitoring market",
+                "trading":      "Live trading — monitoring market",
                 "idle":         "Ready to start",
                 "error":        "An error occurred",
             }
@@ -1760,11 +1406,8 @@ class App(ctk.CTk):
             self._card_lev.configure(text="--")
             self._btn_start.configure(state="normal")
             self._btn_stop.configure(state="disabled")
-            self._mode_seg.configure(state="normal")
             self._risk_menu.configure(state="normal")
             self._btn_apply_risk.configure(state="normal")
-            self._days_menu.configure(state="normal")
-            self._btn_apply_days.configure(state="normal")
             self._tests_menu.configure(state="normal")
             self._btn_apply_tests.configure(state="normal")
             self._set_status("idle")
@@ -1836,7 +1479,7 @@ class App(ctk.CTk):
             us = "+" if pos["upnl"] >= 0 else ""
             uc = "#3fb950" if pos["upnl"] >= 0 else "#f85149"
             self._lbl_pos_main.configure(
-                text=(f"SHORT  ·  Entry: ${pos['entry_price']:.5f}"
+                text=(f"LONG  ·  Entry: ${pos['entry_price']:.5f}"
                       f"   ·   Take Profit: ${pos['tp_price']:.5f}")
             )
             self._lbl_pos_upnl.configure(
