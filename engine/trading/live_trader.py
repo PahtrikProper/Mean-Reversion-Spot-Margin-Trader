@@ -851,11 +851,34 @@ class LiveRealTrader:
                 except Exception as _lev_err:
                     log.warning(f"[REOPT] set_leverage failed: {_lev_err}")
                 self._recompute_indicators()
+                # Seed analytics for full historical DataFrame so chart shows bands immediately
+                try:
+                    n_ana = _db.bulk_log_seed_analytics(
+                        df=self.df, symbol=self.symbol, interval=self.interval,
+                        ma_len=self.entry_params.ma_len, band_mult=self.entry_params.band_mult,
+                        exit_ma_len=self.exit_params.exit_ma_len,
+                        exit_band_mult=float(self.exit_params.exit_band_mult),
+                        sl_pct=float(self.exit_params.sl_pct),
+                    )
+                    log.info(f"[LIVE] Seeded {n_ana} candle_analytics rows → DB")
+                except Exception as _ana_err:
+                    log.warning(f"[LIVE] bulk_log_seed_analytics failed: {_ana_err}")
                 log.info(
                     f"[REOPT] params updated  {self.symbol} {self.interval}m  "
                     f"MC={new_mc_score:.4f}"
                 )
             else:
+                # Still seed analytics with current params so chart is populated
+                try:
+                    _db.bulk_log_seed_analytics(
+                        df=self.df, symbol=self.symbol, interval=self.interval,
+                        ma_len=self.entry_params.ma_len, band_mult=self.entry_params.band_mult,
+                        exit_ma_len=self.exit_params.exit_ma_len,
+                        exit_band_mult=float(self.exit_params.exit_band_mult),
+                        sl_pct=float(self.exit_params.sl_pct),
+                    )
+                except Exception:
+                    pass
                 log.info(
                     f"[REOPT] MC score {new_mc_score:.4f} <= 0 — keeping current params"
                 )

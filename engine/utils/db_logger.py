@@ -566,6 +566,151 @@ def bulk_log_seed_candles(
     return len(rows)
 
 
+def bulk_log_seed_analytics(
+    df: Any,        # full indicator DataFrame after _recompute_indicators()
+    symbol: str,
+    interval: str,
+    ma_len: int,
+    band_mult: float,
+    exit_ma_len: int = 0,
+    exit_band_mult: float = 0.0,
+    sl_pct: float = 0.0,
+) -> int:
+    """Bulk-insert candle_analytics for all historical seed rows.
+
+    Computes rolling HV-20 and volume ratio vectorially over the full
+    DataFrame.  Uses close price as mark_price proxy (basis_pct NULL).
+    INSERT OR IGNORE — safe to call multiple times without creating
+    duplicates.  Returns the number of rows inserted.
+    """
+    import pandas as _pd
+
+    if df is None or len(df) < 2:
+        return 0
+
+    closes = df["close"].to_numpy(dtype=float)
+    n      = len(df)
+
+    # ── Rolling HV-20 ──────────────────────────────────────────────────────────
+    hv_20_arr = [None] * n
+    for i in range(20, n):
+        window   = closes[i - 20: i + 1]
+        log_rets = np.log(window[1:] / np.where(window[:-1] > 0, window[:-1], np.nan))
+        try:
+            hv_20_arr[i] = float(np.std(log_rets[np.isfinite(log_rets)], ddof=1))
+        except Exception:
+            pass
+
+    # ── Rolling volume ratio (current / 19-bar avg) ────────────────────────────
+    vol_ratio_arr = [None] * n
+    if "volume" in df.columns:
+        vols = df["volume"].to_numpy(dtype=float)
+        for i in range(19, n):
+            window  = vols[i - 19: i + 1]
+            avg_vol = float(np.mean(window[:-1]))
+            vol_ratio_arr[i] = float(window[-1] / avg_vol) if avg_vol > 0 else None
+
+    # ── Build rows ─────────────────────────────────────────────────────────────
+    def _s(v):
+        """Safe float — returns None for NaN/Inf."""
+        if v is None:
+            return None
+        try:
+            fv = float(v)
+            return None if (math.isnan(fv) or math.isinf(fv)) else fv
+        except (TypeError, ValueError):
+            return None
+
+    rows = []
+    for i, (_, row) in enumerate(df.iterrows()):
+        ts_ms  = int(row["ts"])
+        ts_utc = _pd.Timestamp(ts_ms, unit="ms", tz="UTC").strftime("%Y-%m-%d %H:%M:%S")
+
+        o   = _s(row.get("open"))
+        h   = _s(row.get("high"))
+        l   = _s(row.get("low"))
+        c   = _s(row.get("close"))
+        vol = _s(row.get("volume", 0))
+
+        rng = (h - l) if (h is not None and l is not None) else 0.0
+        if rng and rng > 0 and o is not None and c is not None:
+            body             = c - o
+            body_ratio       = _s(body / rng)
+            upper_wick_ratio = _s((h - max(o, c)) / rng)
+            lower_wick_ratio = _s((min(o, c) - l) / rng)
+            direction = "doji" if abs(body_ratio or 0) < 0.1 else ("bullish" if body > 0 else "bearish")
+        else:
+            body_ratio = upper_wick_ratio = lower_wick_ratio = None
+            direction = "doji"
+
+        def _col(key):
+            v = row.get(key)
+            if v is None:
+                return None
+            try:
+                fv = float(v)
+                return None if (math.isnan(fv) or math.isinf(fv)) else fv
+            except (TypeError, ValueError):
+                return None
+
+        ma_val   = _col("main")
+        adx_val  = _col("adx")
+        rsi_val  = _col("rsi")
+        premiums  = [_col(f"premium_{k}")  for k in range(1, 9)]
+        discounts = [_col(f"discount_{k}") for k in range(1, 9)]
+
+        p8, d8 = premiums[7], discounts[7]
+        band_width_pct  = _s(((p8 - d8) / c * 100) if (p8 and d8 and c and c > 0) else None)
+        dist_premiums   = [_s(((p - c) / c * 100) if (p and c and c > 0) else None) for p in premiums]
+        dist_discounts  = [_s(((c - d) / c * 100) if (d and c and c > 0) else None) for d in discounts]
+
+        rows.append((
+            ts_utc, symbol, interval,
+            body_ratio, upper_wick_ratio, lower_wick_ratio, direction,
+            ma_val, adx_val, rsi_val,
+            *premiums, *discounts,
+            band_width_pct,
+            *dist_premiums, *dist_discounts,
+            hv_20_arr[i], vol, vol_ratio_arr[i],
+            c, None,            # mark_price = close proxy; basis_pct = NULL
+            ma_len, band_mult,
+            exit_ma_len, exit_band_mult, sl_pct,
+        ))
+
+    if not rows:
+        return 0
+    with _lock:
+        _conn.executemany(
+            """INSERT OR IGNORE INTO candle_analytics (
+                ts_utc, symbol, interval,
+                body_ratio, upper_wick_ratio, lower_wick_ratio, candle_direction,
+                ma, adx, rsi,
+                premium_1, premium_2, premium_3, premium_4,
+                premium_5, premium_6, premium_7, premium_8,
+                discount_1, discount_2, discount_3, discount_4,
+                discount_5, discount_6, discount_7, discount_8,
+                band_width_pct,
+                dist_to_premium_1, dist_to_premium_2, dist_to_premium_3, dist_to_premium_4,
+                dist_to_premium_5, dist_to_premium_6, dist_to_premium_7, dist_to_premium_8,
+                dist_to_discount_1, dist_to_discount_2, dist_to_discount_3, dist_to_discount_4,
+                dist_to_discount_5, dist_to_discount_6, dist_to_discount_7, dist_to_discount_8,
+                hv_20, volume, volume_ratio,
+                mark_price, basis_pct,
+                ma_len, band_mult,
+                exit_ma_len, exit_band_mult, sl_pct
+            ) VALUES (
+                ?,?,?,?,?,?,?,?,?,?,
+                ?,?,?,?,?,?,?,?,
+                ?,?,?,?,?,?,?,?,
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                ?,?,?,?,?,?,?,?,?
+            )""",
+            rows,
+        )
+        _conn.commit()
+    return len(rows)
+
+
 def log_candle_analytics(
     ts_utc: str,
     symbol: str,

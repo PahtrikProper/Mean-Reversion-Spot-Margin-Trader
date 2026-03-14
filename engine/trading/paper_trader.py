@@ -693,6 +693,18 @@ class PaperTrader:
                 self.exit_params  = best_exit_p
                 self.leverage     = best_exit_p.leverage
                 self._recompute_indicators()
+                # Seed analytics for full historical DataFrame so chart shows bands immediately
+                try:
+                    n_ana = _db.bulk_log_seed_analytics(
+                        df=self.df, symbol=self.symbol, interval=self.interval,
+                        ma_len=self.entry_params.ma_len, band_mult=self.entry_params.band_mult,
+                        exit_ma_len=self.exit_params.exit_ma_len,
+                        exit_band_mult=float(self.exit_params.exit_band_mult),
+                        sl_pct=float(self.exit_params.sl_pct),
+                    )
+                    log.info(f"[PAPER] Seeded {n_ana} candle_analytics rows → DB")
+                except Exception as _ana_err:
+                    log.warning(f"[PAPER] bulk_log_seed_analytics failed: {_ana_err}")
                 log.info(
                     f"[PAPER][REOPT] {'switched + ' if _switched else ''}params updated "
                     f"(MC={new_mc_score:.4f})"
@@ -701,6 +713,17 @@ class PaperTrader:
                 log.info(
                     f"[PAPER][REOPT] MC score {new_mc_score:.4f} <= 0 — keeping old params"
                 )
+                # Still seed analytics with current params so chart is populated
+                try:
+                    _db.bulk_log_seed_analytics(
+                        df=self.df, symbol=self.symbol, interval=self.interval,
+                        ma_len=self.entry_params.ma_len, band_mult=self.entry_params.band_mult,
+                        exit_ma_len=self.exit_params.exit_ma_len,
+                        exit_band_mult=float(self.exit_params.exit_band_mult),
+                        sl_pct=float(self.exit_params.sl_pct),
+                    )
+                except Exception:
+                    pass
 
         except Exception as e:
             log.error(f"[PAPER][REOPT] failed: {e}", exc_info=True)
