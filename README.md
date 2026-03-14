@@ -150,8 +150,8 @@ The GUI is designed to fit a standard 13-inch screen (~1280×832 px) without scr
 | Testing Period | Days of candle history used for optimisation (2–90 days) |
 | Number of Tests | Optimiser trials per symbol/interval pair |
 | Intervals | Candle sizes to test (1m, 3m, 5m, 15m, 30m, 60m) |
-| Symbols | Comma-separated list of Bybit USDT perpetual symbols for **LIVE** mode. Paper mode always runs all four configured symbols (XRPUSDT, ETHUSDT, ESPUSDT, BTCUSDT) independently |
-| Leverage | Leverage multiplier for paper trading (1x–100x); live mode reads the actual setting from Bybit |
+| Symbols | Comma-separated list of Bybit USDT perpetual symbols for **LIVE** mode. Paper mode runs all configured `PAPER_SYMBOLS` (default: XRPUSDT only) independently |
+| Leverage | Initial default leverage (1x–100x). The optimiser searches the range 2–14× and may override this; live mode reads the confirmed setting from Bybit |
 
 Every setting has a dedicated **Apply** button. Changes take effect only when Apply is clicked; they are also locked in automatically when **START** is pressed.
 
@@ -212,7 +212,7 @@ python main.py --paper --max-loss 3
 1. Load and validate API credentials (env vars → saved file → interactive prompt)
 2. Read actual leverage from Bybit for each symbol; log it and warn if it differs from the GUI/config setting
 3. Download seed candle history for each (symbol, interval) pair
-4. Run the parameter optimiser (~4 000 backtest trials per pair); each pair logs `Testing {sym} {iv}m — leverage = Nx`
+4. Run the 12-dim parameter optimiser (~4 000 backtest trials per pair, each on a random 5–30-day window); each pair logs `Testing {sym} {iv}m — leverage = Nx`
 5. Rank all pairs by score: `PnL% / (1 + max_drawdown%)`; launch the top-ranked trader per symbol
 6. Connect to Bybit WebSocket and begin live trading
 7. `TradingStatusMonitor` prints a full status table every 3 minutes
@@ -220,7 +220,7 @@ python main.py --paper --max-loss 3
 ### Paper trading startup sequence
 
 1. Download public candle history for all paper symbols (no API keys needed)
-2. Run the parameter optimiser for each (symbol, interval) pair across all symbols: XRPUSDT, ETHUSDT, ESPUSDT, BTCUSDT
+2. Run the parameter optimiser for each (symbol, interval) pair across all configured `PAPER_SYMBOLS` (default: XRPUSDT)
 3. Rank all pairs by score; launch the top-ranked paper trader **for each symbol independently**
 4. All symbol traders run concurrently — each has its own position gate, so they never block one another
 5. Connect to Bybit public WebSocket for live candle data
@@ -261,15 +261,16 @@ Place the file anywhere and pass it with `--config`.
 |----------|---------|-------------|
 | `SYMBOLS` | `["XRPUSDT"]` | Active symbols for **LIVE** mode; overridden by the GUI Symbols field or `--symbols` CLI flag. Paper mode uses `PAPER_SYMBOLS` instead |
 | `CANDLE_INTERVALS` | `["1","3","5"]` | Candle sizes (minutes) tested during optimisation |
-| `DEFAULT_LEVERAGE` | `10.0` | Leverage for paper trading (live mode reads the actual setting from Bybit) |
+| `DEFAULT_LEVERAGE` | `10.0` | Initial fallback leverage (overridden by the 12-dim optimiser on first run) |
 | `STARTING_WALLET` | `100.0` | Simulated wallet used by the backtester and optimiser (not the paper trading wallet) |
 | `PAPER_STARTING_BALANCE` | `500.0` | Virtual wallet size for paper trading (USDT) |
 | `MAX_SYMBOL_FRACTION` | `0.45` | Max wallet fraction used as margin per trade |
-| `MAX_ACTIVE_SYMBOLS` | `1` | Maximum simultaneous traders in **LIVE** mode (one per symbol). Paper mode always launches all configured `PAPER_SYMBOLS` independently |
-| `DAYS_BACK_SEED` | `1` | Days of history downloaded for seed + re-optimisation |
+| `MAX_ACTIVE_SYMBOLS` | `1` | Maximum simultaneous traders in **LIVE** mode (one per symbol). Paper mode launches all configured `PAPER_SYMBOLS` independently (default: XRPUSDT only) |
+| `DAYS_BACK_SEED` | `30` | Days of history downloaded for seed; each optimiser trial uses a random 5–30-day slice |
 | `INIT_TRIALS` | `4000` | Optimiser trials at startup |
-| `REOPT_INTERVAL_SEC` | `28800` | Re-optimise every 8 hours when flat |
-| `LIVE_TP_SCALE` | `0.75` | Server-side TP is placed at 75% of backtested distance |
+| `REOPT_INTERVAL_SEC` | `43200` | Re-optimise every **12 hours** when flat |
+| `LIVE_TP_SCALE` | `1.0` | Server-side TP is placed at exactly the backtested distance |
+| `VOL_FILTER_MAX_PCT` | `5.0` | Entry vetoed if position notional > 5% of candle USDT volume |
 | `TIME_TP_HOURS` | `20.0` | Hours after entry before the data-driven time TP kicks in |
 | `TIME_TP_FALLBACK_PCT` | `0.005` | 0.5% fallback TP when the DB has insufficient trade history |
 | `TIME_TP_SCALE` | `0.75` | Scale factor applied to the data-driven average TP % |
@@ -288,8 +289,8 @@ Place the file anywhere and pass it with `--config`.
 
 The bot enters short when price touches a premium band above the RMA centre line and then drops back below it (band crossover), signalling a failed breakout. Two gates must pass:
 
-- **ADX < 25** — market must be range-bound
-- **RSI ≥ 40** — not already deeply oversold
+- **ADX < adx_threshold** — market must be range-bound (threshold optimised: 20–28)
+- **RSI ≥ rsi_neutral_lo** — not already deeply oversold (threshold optimised: 40–60)
 
 **Exit priority (strictly ordered):**
 
@@ -302,7 +303,7 @@ The bot enters short when price touches a premium band above the RMA centre line
 
 In **live** mode, TP and liquidation are handled server-side by Bybit; stop-loss and band exits are checked on every closed candle. In **paper** mode, all four exits are simulated locally using the exact Bybit liquidation formula with the user-selected leverage. Slippage (1 tick) is applied to all simulated fills.
 
-The optimiser searches six parameters — entry MA length, entry band mult, exit MA length, exit band mult, TP %, and SL % — and re-runs every 8 hours in a background thread so live candle processing is never blocked. All (symbol, interval) pairs are ranked by `score = PnL% / (1 + max_drawdown%)` and the top-ranked pair per symbol is selected for trading.
+The optimiser searches **12 parameters** — entry MA length, entry band multiplier, ADX threshold, RSI threshold, band EMA length, ADX period, RSI period, exit MA length, exit band multiplier, TP %, SL %, and leverage — and re-runs every **12 hours** in a background thread so live candle processing is never blocked. Each trial uses a random 5–30-day slice of the 30-day seeded dataset to prevent window overfitting. A volume filter (5% of candle USDT volume) vetoes entries on thin candles. All (symbol, interval) pairs are ranked by `score = PnL% / (1 + max_drawdown%)` and the top-ranked pair per symbol is selected for trading.
 
 See **`STRATEGY.md`** for the complete specification including exact formulas and all invariants.
 

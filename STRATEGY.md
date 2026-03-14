@@ -1,6 +1,6 @@
 # Mean Reversion Strategy — Reference Document
 
-**Version**: 6.2
+**Version**: 7.0
 **Package**: `engine/`
 **Instrument**: Bybit USDT linear perpetuals (configurable)
 **Direction**: SHORT only — no long trades exist or should be added
@@ -41,8 +41,8 @@ discount_k = EMA(main * (1 - band_mult * 0.01 * k), 5)    for k = 1..8
 
 ### Gates
 ```
-ADX  = ADX(14)   — Wilder's method
-RSI  = RSI(14)   — Wilder's method (avg_gain / avg_loss via RMA)
+ADX  = ADX(adx_period)   — Wilder's method; adx_period is optimised (7–21)
+RSI  = RSI(rsi_period)   — Wilder's method (avg_gain / avg_loss via RMA); rsi_period is optimised (7–21)
 ```
 
 ---
@@ -68,8 +68,8 @@ Both gates must pass for the signal to be accepted:
 
 | Gate | Condition to BLOCK entry | Reason |
 |------|--------------------------|--------|
-| ADX  | `ADX >= 25`              | Trending market — mean reversion unreliable |
-| RSI  | `RSI < 40`               | Already deeply oversold — don't fade exhausted moves |
+| ADX  | `ADX >= adx_threshold`   | Trending market — mean reversion unreliable; threshold optimised (20–28) |
+| RSI  | `RSI < rsi_neutral_lo`   | Already deeply oversold — don't fade exhausted moves; threshold optimised (40–60) |
 
 ### Implementation
 ```python
@@ -111,27 +111,36 @@ compute_exit_signals_raw(current_row, prev_row, current_low, current_high) -> in
 
 ## Parameters
 
-### Optimised Parameters (searched every 8 hours)
+### Optimised Parameters (12-dimensional search — runs every 12 hours)
+
+#### Entry Parameters
 
 | Parameter | Dataclass | Default | Search Range |
 |-----------|-----------|---------|--------------|
 | `ma_len` | `EntryParams` | 100 | 2 – 300 (int) |
 | `band_mult` | `EntryParams` | 2.5 | 0.3 – 10.0 % (stored ×10 as int during search) |
+| `adx_threshold` | `EntryParams` | 25.0 | 20 – 28 (int) |
+| `rsi_neutral_lo` | `EntryParams` | 40.0 | 40 – 60 (int) |
+| `band_ema_len` | `EntryParams` | 5 | 2 – 15 (int) |
+| `adx_period` | `EntryParams` | 14 | 7 – 21 (int) |
+| `rsi_period` | `EntryParams` | 14 | 7 – 21 (int) |
+
+#### Exit Parameters
+
+| Parameter | Dataclass | Default | Search Range |
+|-----------|-----------|---------|--------------|
 | `exit_ma_len` | `ExitParams` | 100 | 2 – 300 (int) |
 | `exit_band_mult` | `ExitParams` | 2.5 | 0.3 – 10.0 % (stored ×10 as int during search) |
-| `tp_pct` | `ExitParams` | 0.0028 | 18 – 1100 bp × 0.0001 (0.18% – 11.00%) |
+| `tp_pct` | `ExitParams` | 0.003 | 20 – 100 bp × 0.0001 (0.20% – 1.00%) |
 | `sl_pct` | `ExitParams` | 0.05 | 50 – 900 bp × 0.0001 (0.50% – 9.00%) |
+| `leverage` | `ExitParams` | 10.0 | 2 – 14 (int) |
 
 ### Fixed Constants (never optimised)
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| `ADX_THRESHOLD` | 25.0 | `indicators.py` |
-| `RSI_NEUTRAL_LO` | 40.0 | `indicators.py` |
-| `ADX_PERIOD` | 14 | `indicators.py` |
-| `RSI_PERIOD` | 14 | `indicators.py` |
-| `BAND_EMA_LENGTH` | 5 | `indicators.py` |
-| `LIVE_TP_SCALE` | 0.75 | `constants.py` |
+| `VOL_FILTER_MAX_PCT` | 5.0 % | `constants.py` — skip entry if position notional > 5% of candle USDT volume |
+| `LIVE_TP_SCALE` | 1.0 | `constants.py` — server TP matches backtested distance exactly |
 | `SIGNAL_DROUGHT_HOURS` | 4.0 | `constants.py` |
 | `MAX_LOSS_PCT` | None | `constants.py` (set via `--max-loss` CLI flag) |
 | `TIME_TP_HOURS` | 20.0 | `constants.py` |
@@ -141,7 +150,9 @@ compute_exit_signals_raw(current_row, prev_row, current_low, current_high) -> in
 | `MAKER_FEE_RATE` | 0.0002 | `constants.py` |
 | `SLIPPAGE_TICKS` | 1 | `constants.py` |
 
-`LIVE_TP_SCALE`: the server-side TP is set at 75% of the backtested distance so it sits closer to the fill price and is more reliably triggered.
+`VOL_FILTER_MAX_PCT`: if the position notional at the proposed entry price would exceed 5% of the candle's USDT volume, the entry is skipped and logged as a `VOL_FILTER` block.
+
+`LIVE_TP_SCALE`: set to 1.0 — the server-side TP is placed at exactly the backtested distance (no scaling offset).
 
 `SLIPPAGE_TICKS`: applied to all simulated (paper / backtest) fills via `apply_slippage()` in `orders.py`. SHORT entry (sell) receives `price - tick`; cover exit (buy) receives `price + tick`. Live fills rely on Bybit execution.
 
@@ -171,6 +182,17 @@ mc_score = median(pnl_pct) × P(profitable) / (1 + percentile_95(max_drawdown))
 ```
 If the score is ≤ 0 the old params are kept.
 
+### 30-Day Rolling Windows
+Each trial draws a **random contiguous slice** of 5–30 days from the full 30-day seeded dataset (`DAYS_BACK_SEED = 30`). This prevents overfitting to any single time window and improves out-of-sample robustness.
+
+### Volume Filter
+Before placing an entry, the bot checks:
+```
+position_notional = qty × entry_price
+max_allowed = candle_volume_usdt × VOL_FILTER_MAX_PCT (5%)
+```
+If `position_notional > max_allowed`, the entry is vetoed and logged as `VOL_FILTER` in the `events` table. This avoids taking positions that would dominate thin candles.
+
 ### Note on `optimise_bayesian`
 `optimise_bayesian` exported from `optimizer.py` is an **alias** for `optimise_params`. It is the same random-search engine with exploitation/exploration split — not a Bayesian (TPE) implementation.
 
@@ -198,7 +220,7 @@ min_candles_required = ma_len + 20
 No signals are generated until this many candles have been received.
 
 ### Re-Optimisation
-- Triggered every `REOPT_INTERVAL_SEC` (8 hours) when flat (no open position)
+- Triggered every `REOPT_INTERVAL_SEC` (12 hours) when flat (no open position)
 - Runs in a **background daemon thread** — never blocks the WebSocket callback
 - Uses `saved_best` exploitation: samples near current params for 60% of trials
 
@@ -250,13 +272,13 @@ Paper trading uses `PaperTrader` (`paper_trader.py`) instead of `LiveRealTrader`
 1. **SHORT only.** No long entries. No flip logic.
 2. **Exit priority is fixed**: Liquidation → TP → Stop-Loss → Band. This must be identical in `backtester.py` and `live_trader.py`.
 3. **Hard stop-loss only.** `sl_pct` is optimised alongside `tp_pct`. No trail stop.
-4. **Band EMA length is always 5.** This is not a parameter.
-5. **ADX threshold is always 25, RSI threshold is always 40.** These are not optimised.
+4. **Band EMA length is optimised (2–15).** `band_ema_len` is a search dimension, not a fixed constant.
+5. **ADX threshold (20–28), RSI threshold (40–60), ADX period (7–21), and RSI period (7–21) are all optimised.** Do not treat them as fixed constants.
 6. **The optimiser sorts internally by (n_losses ASC, return_pct DESC).** Pair selection uses `pnl_pct / (1 + max_drawdown_pct)`. Do not conflate these two scoring steps.
 7. **Last-price for signals, mark-price for liquidation.** This split must be preserved in the backtester.
 8. **`_maybe_reoptimise` must never block the WebSocket thread.** It spawns `_run_reoptimise` as a daemon thread.
 9. **Gate must always be released when a position closes**, including on early returns and exceptions inside `_execute_exit`.
-10. **`LIVE_TP_SCALE = 0.75`** — the server-side TP distance is always scaled to 75% of the backtested distance.
+10. **`LIVE_TP_SCALE = 1.0`** — the server-side TP is placed at exactly the backtested distance (no scaling).
 11. **`SLIPPAGE_TICKS = 1`** — applies to paper/backtest fills only; live fills rely on Bybit execution.
 12. **Data-driven time TP** — after `TIME_TP_HOURS` (20 h) of holding, `compute_time_tp_pct()` queries the top-3 profitable 20h+ exits from the DB, averages their TP%, scales by `TIME_TP_SCALE` (0.75), and substitutes the result as the active TP. Falls back to `TIME_TP_FALLBACK_PCT` (0.5%) if fewer than 3 qualifying trades exist. Exit reason is `TIME_TP` (not `TP`) when this fires.
 13. **SQLite only — no CSV or log files.** All trade data, signals, orders, optimisation runs, events, and diagnostics are written exclusively to `data/trading.db`. `csv_append` and `ensure_csv` in `logger.py` are permanent no-ops.
@@ -274,7 +296,7 @@ Paper trading uses `PaperTrader` (`paper_trader.py`) instead of `LiveRealTrader`
 | `engine/core/indicators.py` | All indicator maths: RMA, EMA, ATR, ADX, RSI, band construction, crossover detection, signal generation |
 | `engine/core/orders.py` | Slippage simulation: `apply_slippage(price, side)` — 1 tick applied to all simulated fills |
 | `engine/backtest/backtester.py` | Historical backtest engine; single run and Monte Carlo |
-| `engine/optimize/optimizer.py` | Random-search optimiser over the 3-parameter space (ma_len, band_mult, tp_pct); `optimise_bayesian` is an alias for `optimise_params` |
+| `engine/optimize/optimizer.py` | Random-search optimiser over the 12-parameter space; `optimise_bayesian` is an alias for `optimise_params`; 30-day rolling windows; volume filter |
 | `engine/trading/live_trader.py` | Live trading engine: WebSocket candle processing, entry/exit execution, re-optimisation |
 | `engine/trading/paper_trader.py` | Paper trading engine: simulates fills, fees, slippage, liquidation locally using public data |
 | `engine/trading/bybit_client.py` | Bybit REST + WebSocket client, order placement, execution polling |

@@ -162,6 +162,7 @@ def backtest_once(
                     qty=qty_abs, entry_fee=entry_fee, exit_fee=exit_fee,
                     pnl_gross=pnl_gross, pnl_net=pnl_net,
                     reason="LIQUIDATION", wallet_at_entry=wallet_at_entry,
+                    hold_candles=i - entry_candle_idx,
                 ))
                 wallet_history.append(wallet)
                 liquidated = True
@@ -189,6 +190,7 @@ def backtest_once(
                     pnl_gross=pnl_gross, pnl_net=pnl_net,
                     reason="TIME_TP" if time_tp_applied else "TP",
                     wallet_at_entry=wallet_at_entry,
+                    hold_candles=i - entry_candle_idx,
                 ))
                 pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                 wallet_at_entry = 0.0; in_position = False
@@ -212,6 +214,7 @@ def backtest_once(
                         qty=qty_abs, entry_fee=entry_fee, exit_fee=exit_fee,
                         pnl_gross=pnl_gross, pnl_net=pnl_net,
                         reason="STOP_LOSS", wallet_at_entry=wallet_at_entry,
+                        hold_candles=i - entry_candle_idx,
                     ))
                     pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                     wallet_at_entry = 0.0; in_position = False
@@ -237,6 +240,7 @@ def backtest_once(
                         pnl_gross=pnl_gross, pnl_net=pnl_net,
                         reason="BAND_EXIT",
                         wallet_at_entry=wallet_at_entry,
+                        hold_candles=i - entry_candle_idx,
                     ))
                     pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                     wallet_at_entry = 0.0; in_position = False
@@ -305,6 +309,12 @@ def backtest_once(
             if dd > max_dd:
                 max_dd = dd
 
+    # ── Hold time stats ────────────────────────────────────────────────────
+    hold_mins = [tr.hold_candles * interval_minutes_bt for tr in trade_records]
+    avg_hold  = float(sum(hold_mins) / len(hold_mins)) if hold_mins else 0.0
+    min_hold  = float(min(hold_mins))                  if hold_mins else 0.0
+    max_hold  = float(max(hold_mins))                  if hold_mins else 0.0
+
     return BacktestResult(
         final_wallet=float(wallet),
         pnl_usdt=float(pnl_u),
@@ -316,6 +326,9 @@ def backtest_once(
         max_drawdown_pct=float(max_dd),
         wallet_history=wallet_history,
         trade_records=trade_records,
+        avg_hold_minutes=avg_hold,
+        min_hold_minutes=min_hold,
+        max_hold_minutes=max_hold,
     )
 
 

@@ -34,6 +34,7 @@ class TradeRecord:
     pnl_net:         float
     reason:          str           # "TP", "TIME_TP", "STOP_LOSS", "BAND_EXIT", "LIQUIDATION"
     wallet_at_entry: float = 0.0
+    hold_candles:    int   = 0     # candles held from entry to exit
 
     @property
     def return_pct(self) -> float:
@@ -52,6 +53,9 @@ class BacktestResult:
     max_drawdown_pct: float             = 0.0
     wallet_history:   List[float]       = field(default_factory=list)
     trade_records:    List[TradeRecord] = field(default_factory=list)
+    avg_hold_minutes: float             = 0.0   # mean position hold time in minutes
+    min_hold_minutes: float             = 0.0   # shortest hold time in minutes
+    max_hold_minutes: float             = 0.0   # longest hold time in minutes
 
 
 # ── Monte Carlo ────────────────────────────────────────────────────────────────

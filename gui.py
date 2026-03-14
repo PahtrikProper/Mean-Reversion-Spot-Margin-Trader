@@ -13,6 +13,7 @@ import queue
 import sys
 import threading
 import time
+import webbrowser
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -1051,7 +1052,7 @@ class App(ctk.CTk):
         # ── Controls ──────────────────────────────────────────────────────────
         ctrl = ctk.CTkFrame(self._scroll, fg_color="#161b22", corner_radius=8)
         ctrl.grid(row=3, column=0, sticky="ew", padx=10, pady=8)
-        ctrl.grid_columnconfigure(3, weight=1)
+        ctrl.grid_columnconfigure(4, weight=1)
 
         self._btn_start = ctk.CTkButton(
             ctrl, text="▶   START", width=150, height=44,
@@ -1080,11 +1081,19 @@ class App(ctk.CTk):
         self._mode_seg.set("LIVE")
         self._mode_seg.grid(row=0, column=2, padx=8, pady=12)
 
+        self._btn_chart = ctk.CTkButton(
+            ctrl, text="📊  Chart", width=110, height=44,
+            fg_color="#1a2a4a", hover_color="#1e3a6a",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._open_chart,
+        )
+        self._btn_chart.grid(row=0, column=3, padx=8, pady=12)
+
         self._lbl_ctrl_msg = ctk.CTkLabel(
             ctrl, text="Enter your API keys and press START",
             text_color="#8b949e", font=ctk.CTkFont(size=12),
         )
-        self._lbl_ctrl_msg.grid(row=0, column=3, padx=14, sticky="w")
+        self._lbl_ctrl_msg.grid(row=0, column=4, padx=14, sticky="w")
 
         # ── Progress bar (hidden until bot starts) ────────────────────────────
         self._prog_outer = ctk.CTkFrame(self._scroll, fg_color="#161b22", corner_radius=8)
@@ -1592,6 +1601,16 @@ class App(ctk.CTk):
         self._set_status("stopping")
         if self._ctrl:
             self._ctrl.stop()
+
+    # ── Chart server ──────────────────────────────────────────────────────────
+    def _open_chart(self) -> None:
+        """Start the Lightweight Charts server (if not running) and open browser."""
+        try:
+            from web.server import start as _start_chart
+            port = _start_chart()
+            webbrowser.open(f"http://127.0.0.1:{port}")
+        except Exception as exc:
+            self._lbl_ctrl_msg.configure(text=f"Chart error: {exc}")
 
     # ── Queue polling ─────────────────────────────────────────────────────────
     def _poll(self) -> None:

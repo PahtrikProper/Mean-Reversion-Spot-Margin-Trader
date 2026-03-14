@@ -405,9 +405,12 @@ def optimise_params(
                 "pnl_usdt":         res.pnl_usdt,
                 "avg_win":          avg_win,
                 "avg_loss":         avg_loss,
-                "max_drawdown_pct": res.max_drawdown_pct,
-                "sharpe":           res.sharpe_ratio,
-                "_result_obj":      res,
+                "max_drawdown_pct":  res.max_drawdown_pct,
+                "sharpe":            res.sharpe_ratio,
+                "avg_hold_minutes":  res.avg_hold_minutes,
+                "min_hold_minutes":  res.min_hold_minutes,
+                "max_hold_minutes":  res.max_hold_minutes,
+                "_result_obj":       res,
             }
             with results_lock:
                 results.append(row_result)
@@ -454,6 +457,8 @@ def optimise_params(
             f"Leverage={best_exit.leverage:.0f}×\n"
             f"  Wins={best['n_wins']}  Losses={best['n_losses']}  WinRate={best['win_rate']:.1f}%  "
             f"PF={pf_str}  Return={best['return_pct']:.2f}%  Trades={best['trades']}\n"
+            f"  Hold     — Avg={best['avg_hold_minutes']:.0f}m  "
+            f"Min={best['min_hold_minutes']:.0f}m  Max={best['max_hold_minutes']:.0f}m\n"
         )
 
     if verbose and best_res.wallet_history:

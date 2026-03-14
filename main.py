@@ -583,6 +583,14 @@ def main():
 
     _start_maintenance_thread()
 
+    # ── Chart server (background, non-blocking) ────────────────────────────
+    try:
+        from web.server import start as _start_chart
+        _chart_port = _start_chart()
+        print(f"  Chart server ready → http://127.0.0.1:{_chart_port}")
+    except Exception as _e:
+        print(f"  Chart server unavailable: {_e}")
+
     if args.paper:
         print("\n" + "=" * 65)
         run_paper_trading()
