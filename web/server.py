@@ -54,7 +54,10 @@ def _make_app():
     # ── Static chart page ──────────────────────────────────────────────────────
     @app.get("/")
     async def index():
-        return FileResponse(str(STATIC_DIR / "index.html"))
+        return FileResponse(
+            str(STATIC_DIR / "index.html"),
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+        )
 
     # ── REST: historical candles + bands ──────────────────────────────────────
     @app.get("/api/history")
