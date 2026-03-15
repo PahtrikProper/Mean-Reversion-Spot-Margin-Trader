@@ -33,7 +33,7 @@ class TradeRecord:
     exit_fee:        float
     pnl_gross:       float
     pnl_net:         float
-    reason:          str           # "TP", "TIME_TP", "TRAIL_STOP", "STOP_LOSS", "BAND_EXIT"
+    reason:          str           # "TP", "TIME_TP", "STOP_LOSS", "BAND_EXIT", "LIQUIDATED"
     wallet_at_entry: float = 0.0
     hold_candles:    int   = 0     # candles held from entry to exit
     entry_ts_ms:     int   = 0     # candle open timestamp at entry (ms since epoch)
@@ -92,7 +92,7 @@ class MCSimResult:
 
 @dataclass
 class EntryParams:
-    """Mean Reversion entry parameters.
+    """Mean Reversion entry parameters (LONG spot margin).
 
     Entry fires when:
         low bounces back above discount_k band (band crossover)

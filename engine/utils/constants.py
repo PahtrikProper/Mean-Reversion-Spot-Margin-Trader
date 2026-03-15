@@ -42,10 +42,10 @@ TIME_TP_FALLBACK_PCT = 0.005  # 0.5% fallback when DB has insufficient data
 TIME_TP_SCALE        = 0.75   # scale factor applied to the data-driven avg
 
 # ── Default strategy parameters ───────────────────────────────────────────────
-DEFAULT_MA_LEN         = 100    # RMA period for entry (premium) band centre line
-DEFAULT_BAND_MULT      = 2.5    # Entry band width multiplier (%)
-DEFAULT_EXIT_MA_LEN    = 100    # RMA period for exit (discount) band centre line
-DEFAULT_EXIT_BAND_MULT = 2.5    # Exit band width multiplier (%)
+DEFAULT_MA_LEN         = 100    # RMA period for premium (exit) band centre line
+DEFAULT_BAND_MULT      = 2.5    # Premium band width multiplier (%)
+DEFAULT_EXIT_MA_LEN    = 100    # RMA period for discount (entry) band centre line; overrides premium when different
+DEFAULT_EXIT_BAND_MULT = 2.5    # Discount band width multiplier (%)
 DEFAULT_TP_PCT         = 0.003  # 0.30% take-profit (default; now also optimised)
 
 # ── Entry gate defaults (also optimised at runtime) ───────────────────────────
@@ -100,9 +100,9 @@ OPT_TP_MAX_BP       = 100   # 1.00% price move (2.5× ATR on 15-min)
 
 # Stop-loss (in basis points; 50 = 0.50%, 900 = 9.00%)
 # Upper bound intentionally below the minimum liquidation distance at max leverage
-# (10× → liq at ~9% below entry) so the optimizer always finds SL-before-liquidation params.
-OPT_SL_MIN_BP       = 50    # 0.50% above entry
-OPT_SL_MAX_BP       = 900   # 9.00% above entry
+# (10× → liq = entry × 9 / 9.95 ≈ 9.55% below entry) so SL always fires before liquidation.
+OPT_SL_MIN_BP       = 50    # 0.50% below entry
+OPT_SL_MAX_BP       = 900   # 9.00% below entry
 
 # ADX gate threshold (integer; 20 = most permissive, 28 = strictest in tested range)
 # Data-driven: 3-min p50=25.13, 5-min p50=20.51, 15-min p50=23.33
