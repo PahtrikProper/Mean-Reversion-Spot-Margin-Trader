@@ -68,10 +68,12 @@ VOL_FILTER_MAX_PCT = 0.05   # 5% of candle USDT volume
 # Optimised alongside TP.
 STOP_LOSS_PCT = 0.05     # default 5.0% below entry (optimised at runtime)
 
-# ── Trailing stop — not yet implemented ───────────────────────────────────────
-# Set to 0.0 — exits via TP, SL, or band exit.
-# When non-zero, would trail the LONG at max_high * (1 - trail_pct).
-TRAIL_STOP_PCT = 0.0
+# ── McIntosh trailing stop (LONG) ────────────────────────────────────────────
+# Trails the LONG position at max_high_since_entry * (1 - trail_pct).
+# Fires between TP and SL (exit priority 2.5): protects profits when price
+# reverses after rising, while allowing the trade to breathe on the way up.
+# Set to 0.0 to disable; non-zero values are always active for LONG trades.
+TRAIL_STOP_PCT = 0.003   # 0.30% below the highest high seen since entry
 
 # ── Optimiser search ranges ───────────────────────────────────────────────────
 INIT_TRIALS          = 4000

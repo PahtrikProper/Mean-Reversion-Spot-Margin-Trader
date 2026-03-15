@@ -11,10 +11,11 @@ Entry:
     AND RSI <= 50 (neutral-to-oversold close confirms the dip)
 
 Exit priority per candle:
-  1. Liquidation  (last low  <= liq_price = entry * (lev-1) / (lev * (1-MMR)))
-  2. Take-profit  (last high >= tp_price = entry * (1 + tp_pct))               [fixed TP, optimised]
-  3. Stop-Loss    (last low  <= entry * (1 - sl_pct))                          [wide guard before liq]
-  4. Band exit    (last high rises above premium_k band)                        [mirrors entry logic]
+  1.   Liquidation    (last low  <= liq_price = entry * (lev-1) / (lev * (1-MMR)))
+  2.   Take-profit    (last high >= tp_price = entry * (1 + tp_pct))             [fixed TP, optimised]
+  2.5  McIntosh Trail (last low  <= max_high * (1 - trail_pct))                  [always on for LONG]
+  3.   Stop-Loss      (last low  <= entry * (1 - sl_pct))                        [wide guard before liq]
+  4.   Band exit      (last high rises above premium_k band)                     [mirrors entry logic]
 """
 
 import pandas as pd
@@ -112,6 +113,7 @@ def backtest_once(
     in_position          = False
     _liq_price_bt        = 0.0   # spot margin LONG liquidation price (0 = no position)
     _was_liquidated      = False  # true if any trade hit liquidation
+    _max_high_bt         = 0.0   # highest high seen since entry (McIntosh trail)
 
     # Time-based TP tightening — tracks when entry occurred and whether applied
     entry_candle_idx:   int  = 0
@@ -139,6 +141,9 @@ def backtest_once(
         # ── Position management ───────────────────────────────────────────────
         if in_position and pos_qty != 0.0:
             qty_abs = abs(pos_qty)
+            # Update McIntosh trail high watermark
+            if high_last > _max_high_bt:
+                _max_high_bt = high_last
 
             # 1. Liquidation check (spot margin LONG — low falls to liq price)
             if _liq_price_bt > 0 and low_last <= _liq_price_bt:
@@ -161,7 +166,7 @@ def backtest_once(
                 pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                 wallet_at_entry = 0.0; in_position = False
                 entry_candle_idx = 0; time_tp_applied = False
-                _liq_price_bt = 0.0
+                _liq_price_bt = 0.0; _max_high_bt = 0.0
                 _was_liquidated = True
                 exited = True
 
@@ -196,7 +201,33 @@ def backtest_once(
                     pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                     wallet_at_entry = 0.0; in_position = False
                     entry_candle_idx = 0; time_tp_applied = False
-                    _liq_price_bt = 0.0
+                    _liq_price_bt = 0.0; _max_high_bt = 0.0
+                    exited = True
+
+            # 2.5 McIntosh trailing stop (price reverses below max_high * (1 - trail_pct))
+            if not exited and pos_qty != 0.0 and float(exit_params.trail_pct) > 0.0:
+                trail_price = _max_high_bt * (1.0 - float(exit_params.trail_pct))
+                if low_last <= trail_price:
+                    fill      = apply_slippage(trail_price, "sell")
+                    pnl_gross = (fill - entry_price_bt) * qty_abs
+                    exit_fee  = (qty_abs * fill) * fee_rate
+                    wallet   += pnl_gross - exit_fee
+                    pnl_net   = pnl_gross - entry_fee - exit_fee
+                    trade_pnls.append(pnl_net)
+                    _exit_ts_raw = dfl.iloc[i]["ts"]
+                    _exit_ts_ms  = int(_exit_ts_raw.value) // 1_000_000 if hasattr(_exit_ts_raw, "value") else int(_exit_ts_raw)
+                    trade_records.append(TradeRecord(
+                        side="LONG", entry_price=entry_price_bt, exit_price=fill,
+                        qty=qty_abs, entry_fee=entry_fee, exit_fee=exit_fee,
+                        pnl_gross=pnl_gross, pnl_net=pnl_net,
+                        reason="TRAIL_STOP", wallet_at_entry=wallet_at_entry,
+                        hold_candles=i - entry_candle_idx,
+                        entry_ts_ms=entry_ts_ms_bt, exit_ts_ms=_exit_ts_ms,
+                    ))
+                    pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
+                    wallet_at_entry = 0.0; in_position = False
+                    entry_candle_idx = 0; time_tp_applied = False
+                    _liq_price_bt = 0.0; _max_high_bt = 0.0
                     exited = True
 
             # 3. Hard stop-loss (price falls below entry * (1 - sl_pct))
@@ -222,7 +253,7 @@ def backtest_once(
                     pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                     wallet_at_entry = 0.0; in_position = False
                     entry_candle_idx = 0; time_tp_applied = False
-                    _liq_price_bt = 0.0
+                    _liq_price_bt = 0.0; _max_high_bt = 0.0
                     exited = True
 
             # 4. Band exit (high rises above premium_k — mirrors discount band entry)
@@ -252,7 +283,7 @@ def backtest_once(
                     pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                     wallet_at_entry = 0.0; in_position = False
                     entry_candle_idx = 0; time_tp_applied = False
-                    _liq_price_bt = 0.0
+                    _liq_price_bt = 0.0; _max_high_bt = 0.0
                     exited = True
 
         # ── Entry ─────────────────────────────────────────────────────────────
@@ -287,6 +318,7 @@ def backtest_once(
                     pos_qty              = qty
                     entry_price_bt       = fill
                     entry_fee            = fee
+                    _max_high_bt         = fill   # McIntosh trail: initialise to entry price
                     in_position      = True
                     entry_candle_idx = i
                     _ts_raw          = dfl.iloc[i]["ts"]
@@ -318,7 +350,7 @@ def backtest_once(
                 pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                 wallet_at_entry = 0.0; in_position = False
                 entry_candle_idx = 0; time_tp_applied = False
-                _liq_price_bt = 0.0
+                _liq_price_bt = 0.0; _max_high_bt = 0.0
                 _was_liquidated = True
                 exited = True
             # 2. Take-profit (same-bar high)
@@ -343,7 +375,32 @@ def backtest_once(
                     pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                     wallet_at_entry = 0.0; in_position = False
                     entry_candle_idx = 0; time_tp_applied = False
-                    _liq_price_bt = 0.0
+                    _liq_price_bt = 0.0; _max_high_bt = 0.0
+                    exited = True
+            # 2.5 McIntosh trailing stop (same-bar)
+            if not exited and pos_qty != 0.0 and float(exit_params.trail_pct) > 0.0:
+                _sb_trail_high  = max(_max_high_bt, high_last)
+                _sb_trail_price = _sb_trail_high * (1.0 - float(exit_params.trail_pct))
+                if low_last <= _sb_trail_price:
+                    fill      = apply_slippage(_sb_trail_price, "sell")
+                    pnl_gross = (fill - entry_price_bt) * qty_abs_sb
+                    exit_fee  = (qty_abs_sb * fill) * fee_rate
+                    wallet   += pnl_gross - exit_fee
+                    pnl_net   = pnl_gross - entry_fee - exit_fee
+                    trade_pnls.append(pnl_net)
+                    _exit_ts_raw = dfl.iloc[i]["ts"]
+                    _exit_ts_ms  = int(_exit_ts_raw.value) // 1_000_000 if hasattr(_exit_ts_raw, "value") else int(_exit_ts_raw)
+                    trade_records.append(TradeRecord(
+                        side="LONG", entry_price=entry_price_bt, exit_price=fill,
+                        qty=qty_abs_sb, entry_fee=entry_fee, exit_fee=exit_fee,
+                        pnl_gross=pnl_gross, pnl_net=pnl_net,
+                        reason="TRAIL_STOP", wallet_at_entry=wallet_at_entry,
+                        hold_candles=0, entry_ts_ms=entry_ts_ms_bt, exit_ts_ms=_exit_ts_ms,
+                    ))
+                    pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
+                    wallet_at_entry = 0.0; in_position = False
+                    entry_candle_idx = 0; time_tp_applied = False
+                    _liq_price_bt = 0.0; _max_high_bt = 0.0
                     exited = True
             # 3. Stop-loss (same-bar low)
             if not exited and pos_qty != 0.0:
@@ -367,7 +424,7 @@ def backtest_once(
                     pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                     wallet_at_entry = 0.0; in_position = False
                     entry_candle_idx = 0; time_tp_applied = False
-                    _liq_price_bt = 0.0
+                    _liq_price_bt = 0.0; _max_high_bt = 0.0
                     exited = True
             # 4. Band exit (same-bar signal)
             if not exited and pos_qty != 0.0:
@@ -393,7 +450,7 @@ def backtest_once(
                     pos_qty = 0.0; entry_price_bt = 0.0; entry_fee = 0.0
                     wallet_at_entry = 0.0; in_position = False
                     entry_candle_idx = 0; time_tp_applied = False
-                    _liq_price_bt = 0.0
+                    _liq_price_bt = 0.0; _max_high_bt = 0.0
                     exited = True
 
         # ── Equity snapshot ───────────────────────────────────────────────────

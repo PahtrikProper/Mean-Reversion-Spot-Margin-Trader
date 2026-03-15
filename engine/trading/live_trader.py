@@ -3,8 +3,9 @@
 Entry:  low bounces back above discount_k band (crossover)
         AND ADX < 25  (range-bound regime)
         AND RSI <= 50 (neutral-to-oversold close confirms the dip)
-Exit:   Liquidation: low  <= entry * (lev-1) / (lev * (1-MMR))           [priority 1]
+Exit:   Liquidation:    low  <= entry * (lev-1) / (lev * (1-MMR))        [priority 1]
         OR take-profit: high >= entry * (1 + tp_pct)                      [priority 2]
+        OR McIntosh trail: low <= max_high * (1 - trail_pct)              [priority 2.5, always on]
         OR stop-loss: low  <= entry * (1 - sl_pct)                        [hard guard; priority 3]
         OR band exit: high rises above premium_k band (mirrors entry logic) [priority 4]
 """
@@ -115,6 +116,9 @@ class LiveRealTrader:
             float(self.position.entry_price) if self.position is not None else None
         )
         self._wallet_at_entry: Optional[float] = None
+        self._max_high_since_entry: Optional[float] = (
+            float(self.position.entry_price) if self.position is not None else None
+        )  # McIntosh trail: highest high seen since entry
 
         if len(df_mark_seed) == 0:
             raise RuntimeError("No mark seed data")
@@ -322,9 +326,10 @@ class LiveRealTrader:
             tp_price = self._format_price(fill_price * (1.0 + float(self.exit_params.tp_pct) * LIVE_TP_SCALE))
 
             # Record entry state and write all logs BEFORE the TP call.
-            self._entry_time      = bar_ts
-            self._entry_price     = fill_price
-            self._wallet_at_entry = wallet_before
+            self._entry_time             = bar_ts
+            self._entry_price            = fill_price
+            self._wallet_at_entry        = wallet_before
+            self._max_high_since_entry   = fill_price  # McIntosh trail: initialise to entry price
 
             log.info(
                 f"{COLOR_SUBMITTED}[{ts_utc}] LONG ENTRY FILLED: "
@@ -417,11 +422,12 @@ class LiveRealTrader:
                 entry_price=entry_price, wallet_before=wallet_before,
                 wallet_after=self.wallet,
             )
-            self._entry_time      = None   # clear entry state on exit
-            self._entry_price     = None
-            self._wallet_at_entry = None
-            self._last_entry_fee  = 0.0
-            self._time_tp_applied = False
+            self._entry_time            = None   # clear entry state on exit
+            self._entry_price           = None
+            self._wallet_at_entry       = None
+            self._last_entry_fee        = 0.0
+            self._time_tp_applied       = False
+            self._max_high_since_entry  = None   # McIntosh trail reset
         except Exception as e:
             log_order(ts_utc=ts_utc, symbol=self.symbol, side="LONG",
                       qty=qty_to_close if qty_to_close else qty_abs,
@@ -499,11 +505,12 @@ class LiveRealTrader:
 
         # Reset all position-tracking state and release the slot.
         self.gate.release(self.symbol)
-        self._entry_time      = None
-        self._entry_price     = None
-        self._wallet_at_entry = None
-        self._last_entry_fee  = 0.0
-        self._time_tp_applied = False
+        self._entry_time           = None
+        self._entry_price          = None
+        self._wallet_at_entry      = None
+        self._last_entry_fee       = 0.0
+        self._time_tp_applied      = False
+        self._max_high_since_entry = None   # McIntosh trail reset
 
     # ── Trade log ──────────────────────────────────────────────────────────────
 
@@ -904,9 +911,10 @@ class LiveRealTrader:
           2. Refresh wallet/position state from Bybit REST
           3. Skip if not enough candles for warm-up
           4. Detect externally-closed position (server TP or manual close)
-          5. Take-profit (high >= entry * (1 + tp_pct))                   [priority 1]
-          6. Stop-loss   (low  <= entry * (1 - sl_pct))                   [priority 2]
-          7. Band exit   (high crosses above premium_k band)              [priority 3]
+          5. Take-profit      (high >= entry * (1 + tp_pct))                  [priority 1]
+          5.5 McIntosh Trail  (low  <= max_high * (1 - trail_pct))            [priority 2, always on]
+          6. Stop-loss        (low  <= entry * (1 - sl_pct))                  [priority 3]
+          7. Band exit        (high crosses above premium_k band)             [priority 4]
           8. Check entry signal (band crossover AND ADX gate AND RSI gate)
           9. Log candle-close summary
         """
@@ -1205,11 +1213,26 @@ class LiveRealTrader:
                 except Exception as _ttp_err:
                     log.warning(f"[{ts_utc}] Time-based TP update failed: {_ttp_err}")
 
+            # ── McIntosh trail: update high watermark each candle ─────────────
+            if self.position is not None and self._max_high_since_entry is not None:
+                if h > self._max_high_since_entry:
+                    self._max_high_since_entry = h
+
             # ── Take-profit check (LONG: high >= tp_price, client-side for spot) ──
             if not acted and self.position is not None and self._entry_price is not None:
                 tp_price_lvl = self._entry_price * (1.0 + float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
                 if h >= tp_price_lvl:
                     self._execute_exit(tp_price_lvl, "TP", ts_utc)
+                    acted = True
+
+            # ── McIntosh trailing stop (priority 2.5: after TP, before hard SL) ──
+            if (not acted
+                    and self.position is not None
+                    and self._max_high_since_entry is not None
+                    and float(self.exit_params.trail_pct) > 0.0):
+                trail_price = self._max_high_since_entry * (1.0 - float(self.exit_params.trail_pct))
+                if l <= trail_price:
+                    self._execute_exit(trail_price, "TRAIL_STOP", ts_utc)
                     acted = True
 
             # ── Hard stop-loss signal (LONG: low falls below sl_price) ──
@@ -1243,8 +1266,12 @@ class LiveRealTrader:
                     if self.position is not None and self._entry_price is not None:
                         _sb_tp = self._entry_price * (1.0 + float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
                         _sl_sb = self._entry_price * (1.0 - float(self.exit_params.sl_pct))
+                        _sb_trail_high  = self._max_high_since_entry if self._max_high_since_entry else self._entry_price
+                        _sb_trail_price = _sb_trail_high * (1.0 - float(self.exit_params.trail_pct))
                         if h >= _sb_tp:
                             self._execute_exit(_sb_tp, "TP", ts_utc)
+                        elif (float(self.exit_params.trail_pct) > 0.0 and l <= _sb_trail_price):
+                            self._execute_exit(_sb_trail_price, "TRAIL_STOP", ts_utc)
                         elif l <= _sl_sb:
                             self._execute_exit(c, "STOP_LOSS", ts_utc)
                         elif exit_sig:

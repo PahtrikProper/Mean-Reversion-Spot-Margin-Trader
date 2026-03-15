@@ -33,7 +33,7 @@ class TradeRecord:
     exit_fee:        float
     pnl_gross:       float
     pnl_net:         float
-    reason:          str           # "TP", "TIME_TP", "STOP_LOSS", "BAND_EXIT", "LIQUIDATED"
+    reason:          str           # "TP", "TIME_TP", "TRAIL_STOP", "STOP_LOSS", "BAND_EXIT", "LIQUIDATED"
     wallet_at_entry: float = 0.0
     hold_candles:    int   = 0     # candles held from entry to exit
     entry_ts_ms:     int   = 0     # candle open timestamp at entry (ms since epoch)
@@ -115,12 +115,13 @@ class ExitParams:
     """Mean Reversion exit parameters (LONG spot margin).
 
     Exit fires on (full system priority order):
-        1. Liquidation: low  <= entry * (leverage-1) / (leverage * (1-MMR))
-        2. TP:          high >= entry * (1 + tp_pct)                  [optimised]
-        3. Stop-Loss:   low  <= entry * (1 - sl_pct)                  [wide guard before liq]
-        4. Band:        high rises above premium_k band                [independent exit-band params]
+        1. Liquidation:  low  <= entry * (leverage-1) / (leverage * (1-MMR))
+        2. TP:           high >= entry * (1 + tp_pct)                     [optimised]
+        2.5 McIntosh Trail: low <= max_high_since_entry * (1 - trail_pct) [always on for LONG]
+        3. Stop-Loss:    low  <= entry * (1 - sl_pct)                     [wide guard before liq]
+        4. Band:         high rises above premium_k band                   [independent exit-band params]
 
-    trail_pct is set to 0.0 — exits via TP, SL, or band exit.
+    trail_pct trails the LONG at max_high_since_entry * (1 - trail_pct).
 
     SL is intentionally wide (default 5%) — designed to guard against large adverse
     moves before liquidation, not to be routinely triggered.  Optimised alongside TP.
