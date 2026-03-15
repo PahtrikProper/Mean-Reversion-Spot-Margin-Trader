@@ -641,6 +641,10 @@ async function loadSymbols() {
       opt.value = 'XRPUSDT'; opt.textContent = 'XRPUSDT'; opt.selected = true;
       sel.appendChild(opt);
     }
+    // CRITICAL: sync the JS symbol variable to whichever option is actually
+    // selected after building the list — prevents loading the wrong symbol
+    // when the bot trades a pair other than the XRPUSDT default.
+    symbol = sel.value;
   } catch (_) {}
 }
 
@@ -702,6 +706,9 @@ const ro = new ResizeObserver(() => {
 [mainEl, volEl, adxEl, rsiEl].forEach(el => ro.observe(el));
 
 // ── Wait for ready ─────────────────────────────────────────────────────────
+// Resolves as soon as the candles table has seed data (>50 rows).
+// The chart will show raw candles immediately; bands/indicators appear
+// once the first optimisation writes candle_analytics rows via WebSocket.
 async function waitForReady() {
   try {
     const r = await fetch(`${BASE}/api/ready`);
@@ -715,18 +722,36 @@ async function waitForReady() {
         const d = await r.json();
         if (d.ready) { clearInterval(t); resolve(); }
       } catch (_) {}
-    }, 3000);
+    }, 2000);
   });
 }
 
+// ── Periodic params refresh (keeps threshold lines current after re-opt) ──
+setInterval(async () => {
+  try {
+    const res = await fetch(`${BASE}/api/params?symbol=${symbol}&interval=${interval}`);
+    const p   = await res.json();
+    let changed = false;
+    if (p && p.adx_threshold  && +p.adx_threshold  !== _adxThreshVal) { _adxThreshVal = +p.adx_threshold;  changed = true; }
+    if (p && p.rsi_neutral_lo && +p.rsi_neutral_lo !== _rsiThreshVal) { _rsiThreshVal = +p.rsi_neutral_lo; changed = true; }
+    if (changed) _updateThreshLines();
+  } catch (_) {}
+}, 30_000);   // every 30 s
+
 // ── Init ───────────────────────────────────────────────────────────────────
 (async () => {
-  document.getElementById('loading-msg').textContent = 'Waiting for first optimisation…';
-  document.getElementById('loading').classList.remove('hidden');
+  const loadingEl = document.getElementById('loading');
+  const loadingMsg = document.getElementById('loading-msg');
+
+  loadingMsg.textContent = 'Waiting for seed data…';
+  loadingEl.classList.remove('hidden');
+
   await waitForReady();
-  await loadSymbols();
-  await loadHistory();
-  connect();
+
+  loadingMsg.textContent = 'Loading chart…';
+  await loadSymbols();   // sets symbol = first available pair
+  await loadHistory();   // loads candles + trades for that symbol
+  connect();             // open WS for live updates
 })();
 </script>
 </body>

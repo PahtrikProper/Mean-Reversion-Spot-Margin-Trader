@@ -42,16 +42,21 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def _db_is_ready() -> bool:
-    """Return True when candle_analytics has at least one row (seed complete)."""
+    """Return True as soon as the candles table has seed data.
+
+    Checking `candles` (not `candle_analytics`) means the chart unblocks
+    immediately after the seed download finishes — bands/indicators fill in
+    progressively once the first optimisation completes.
+    """
     try:
         conn = sqlite3.connect(
             f"file:{DB_PATH}?mode=ro", uri=True, check_same_thread=False
         )
         row = conn.execute(
-            "SELECT COUNT(*) FROM candle_analytics"
+            "SELECT COUNT(*) FROM candles WHERE price_type='last'"
         ).fetchone()
         conn.close()
-        return (row[0] or 0) > 0
+        return (row[0] or 0) > 50   # need at least a minimal seed
     except Exception:
         return False
 
