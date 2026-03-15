@@ -3,14 +3,15 @@
 Searches for the best combination of 12 dimensions:
   EntryParams: ma_len, band_mult, adx_threshold, rsi_neutral_lo, band_ema_len,
                adx_period, rsi_period
-  ExitParams:  tp_pct, sl_pct, exit_ma_len, exit_band_mult, leverage
-               trail_pct is fixed at TRAIL_STOP_PCT (not optimised)
+  ExitParams:  trail_pct, exit_ma_len, exit_band_mult, leverage
+               tp_pct is fixed at DEFAULT_TP_PCT (20% — not optimised)
+               sl_pct is fixed at STOP_LOSS_PCT  (40% — not optimised)
 
 band_mult / exit_band_mult are stored as integer × 10 (3 = 0.3, 100 = 10.0)
 during search for efficient integer arithmetic.
 
-tp_pct is searched in OPT_TP_MIN_BP–OPT_TP_MAX_BP (basis points × 0.0001).
-sl_pct is optimised in OPT_SL_MIN_BP–OPT_SL_MAX_BP (basis points × 0.0001).
+trail_pct is searched in OPT_TRAIL_X10000_MIN–OPT_TRAIL_X10000_MAX
+  (integer × 10000: 10 = 0.10%, 500 = 5.00%).
 adx_period / rsi_period searched in OPT_ADX/RSI_PERIOD_MIN–MAX (7–21).
 leverage searched in OPT_LEVERAGE_VALUES (spot margin: 2×, 3×, 4×, 8×, 10×).
 
@@ -41,6 +42,8 @@ from tqdm import tqdm
 from ..utils.constants import (
     STARTING_WALLET,
     STOP_LOSS_PCT,
+    DEFAULT_TP_PCT,
+    TRAIL_STOP_PCT,
     DEFAULT_EXIT_MA_LEN,
     DEFAULT_EXIT_BAND_MULT,
     ADX_THRESHOLD,
@@ -53,8 +56,7 @@ from ..utils.constants import (
     OPT_BAND_MULT_X10_MIN,      OPT_BAND_MULT_X10_MAX,
     OPT_EXIT_MA_LEN_MIN,        OPT_EXIT_MA_LEN_MAX,
     OPT_EXIT_BAND_MULT_X10_MIN, OPT_EXIT_BAND_MULT_X10_MAX,
-    OPT_TP_MIN_BP,              OPT_TP_MAX_BP,
-    OPT_SL_MIN_BP,              OPT_SL_MAX_BP,
+    OPT_TRAIL_X10000_MIN,       OPT_TRAIL_X10000_MAX,
     OPT_ADX_MIN,                OPT_ADX_MAX,
     OPT_RSI_LO_MIN,             OPT_RSI_LO_MAX,
     OPT_BAND_EMA_MIN,           OPT_BAND_EMA_MAX,
@@ -69,8 +71,7 @@ from ..utils.constants import (
     EXPLOIT_RATIO,
     EXPLOIT_MA_LEN_RADIUS,
     EXPLOIT_BAND_MULT_RADIUS_X10,
-    EXPLOIT_TP_RADIUS_BP,
-    EXPLOIT_SL_RADIUS_BP,
+    EXPLOIT_TRAIL_RADIUS_X10000,
     EXPLOIT_EXIT_MA_LEN_RADIUS,
     EXPLOIT_EXIT_BAND_MULT_RADIUS_X10,
     EXPLOIT_ADX_RADIUS,
@@ -108,9 +109,10 @@ def optimise_params(
     borrow_hourly_rate: float = BORROW_HOURLY_RATE,
 ) -> Dict[str, Any]:
     """Random search over 12 dimensions:
-      (ma_len, band_mult, tp_pct, sl_pct, exit_ma_len, exit_band_mult,
+      (ma_len, band_mult, trail_pct, exit_ma_len, exit_band_mult,
        adx_threshold, rsi_neutral_lo, band_ema_len,
        adx_period, rsi_period, leverage)
+      tp_pct=DEFAULT_TP_PCT (20%) and sl_pct=STOP_LOSS_PCT (40%) are fixed.
 
     Per-trial: random contiguous window of OPT_MIN_DAYS–OPT_MAX_DAYS (5–30) days
     sampled from the full seeded dataset, giving exposure to multiple market regimes.
@@ -151,12 +153,9 @@ def optimise_params(
         b_bm_x10     = int(np.clip(
             round(float(saved_best.get("band_mult", 2.5)) * 10),
             OPT_BAND_MULT_X10_MIN, OPT_BAND_MULT_X10_MAX))
-        b_tp_bp      = int(np.clip(
-            round(float(saved_best.get("tp_pct", _C.DEFAULT_TP_PCT)) * 10000),
-            OPT_TP_MIN_BP, OPT_TP_MAX_BP))
-        b_sl_bp      = int(np.clip(
-            round(float(saved_best.get("sl_pct", STOP_LOSS_PCT)) * 10000),
-            OPT_SL_MIN_BP, OPT_SL_MAX_BP))
+        b_trail_x10000 = int(np.clip(
+            round(float(saved_best.get("trail_pct", TRAIL_STOP_PCT)) * 10000),
+            OPT_TRAIL_X10000_MIN, OPT_TRAIL_X10000_MAX))
         b_exit_ma    = int(np.clip(
             saved_best.get("exit_ma_len", DEFAULT_EXIT_MA_LEN),
             OPT_EXIT_MA_LEN_MIN, OPT_EXIT_MA_LEN_MAX))
@@ -191,12 +190,10 @@ def optimise_params(
                 rng.integers(b_bm_x10 - EXPLOIT_BAND_MULT_RADIUS_X10,
                              b_bm_x10 + EXPLOIT_BAND_MULT_RADIUS_X10 + 1),
                 OPT_BAND_MULT_X10_MIN, OPT_BAND_MULT_X10_MAX))
-            tp_bp      = int(np.clip(
-                rng.integers(b_tp_bp - EXPLOIT_TP_RADIUS_BP, b_tp_bp + EXPLOIT_TP_RADIUS_BP + 1),
-                OPT_TP_MIN_BP, OPT_TP_MAX_BP))
-            sl_bp      = int(np.clip(
-                rng.integers(b_sl_bp - EXPLOIT_SL_RADIUS_BP, b_sl_bp + EXPLOIT_SL_RADIUS_BP + 1),
-                OPT_SL_MIN_BP, OPT_SL_MAX_BP))
+            trail_x10000 = int(np.clip(
+                rng.integers(b_trail_x10000 - EXPLOIT_TRAIL_RADIUS_X10000,
+                             b_trail_x10000 + EXPLOIT_TRAIL_RADIUS_X10000 + 1),
+                OPT_TRAIL_X10000_MIN, OPT_TRAIL_X10000_MAX))
             exit_ma    = int(np.clip(
                 rng.integers(b_exit_ma - EXPLOIT_EXIT_MA_LEN_RADIUS,
                              b_exit_ma + EXPLOIT_EXIT_MA_LEN_RADIUS + 1),
@@ -226,7 +223,7 @@ def optimise_params(
             _lo = max(0, _b_lev_idx - EXPLOIT_LEVERAGE_RADIUS)
             _hi = min(len(OPT_LEVERAGE_VALUES) - 1, _b_lev_idx + EXPLOIT_LEVERAGE_RADIUS)
             lev_int    = int(OPT_LEVERAGE_VALUES[int(rng.integers(_lo, _hi + 1))])
-            key = (ma, bm_x10, tp_bp, sl_bp, exit_ma, exit_bm_x10,
+            key = (ma, bm_x10, trail_x10000, exit_ma, exit_bm_x10,
                    adx_int, rsi_lo_int, band_ema, adx_period, rsi_period, lev_int)
             if key not in seen:
                 seen.add(key)
@@ -236,19 +233,18 @@ def optimise_params(
     attempts = 0
     while len(combos) < trials and attempts < trials * 20:
         attempts += 1
-        ma          = int(rng.integers(OPT_MA_LEN_MIN,             OPT_MA_LEN_MAX             + 1))
-        bm_x10      = int(rng.integers(OPT_BAND_MULT_X10_MIN,      OPT_BAND_MULT_X10_MAX      + 1))
-        tp_bp       = int(rng.integers(OPT_TP_MIN_BP,              OPT_TP_MAX_BP              + 1))
-        sl_bp       = int(rng.integers(OPT_SL_MIN_BP,              OPT_SL_MAX_BP              + 1))
-        exit_ma     = int(rng.integers(OPT_EXIT_MA_LEN_MIN,        OPT_EXIT_MA_LEN_MAX        + 1))
-        exit_bm_x10 = int(rng.integers(OPT_EXIT_BAND_MULT_X10_MIN, OPT_EXIT_BAND_MULT_X10_MAX + 1))
-        adx_int     = int(rng.integers(OPT_ADX_MIN,                OPT_ADX_MAX                + 1))
-        rsi_lo_int  = int(rng.integers(OPT_RSI_LO_MIN,             OPT_RSI_LO_MAX             + 1))
-        band_ema    = int(rng.integers(OPT_BAND_EMA_MIN,           OPT_BAND_EMA_MAX           + 1))
-        adx_period  = int(rng.integers(OPT_ADX_PERIOD_MIN,         OPT_ADX_PERIOD_MAX         + 1))
-        rsi_period  = int(rng.integers(OPT_RSI_PERIOD_MIN,         OPT_RSI_PERIOD_MAX         + 1))
-        lev_int     = int(OPT_LEVERAGE_VALUES[int(rng.integers(0, len(OPT_LEVERAGE_VALUES)))])
-        key = (ma, bm_x10, tp_bp, sl_bp, exit_ma, exit_bm_x10,
+        ma           = int(rng.integers(OPT_MA_LEN_MIN,             OPT_MA_LEN_MAX             + 1))
+        bm_x10       = int(rng.integers(OPT_BAND_MULT_X10_MIN,      OPT_BAND_MULT_X10_MAX      + 1))
+        trail_x10000 = int(rng.integers(OPT_TRAIL_X10000_MIN,       OPT_TRAIL_X10000_MAX       + 1))
+        exit_ma      = int(rng.integers(OPT_EXIT_MA_LEN_MIN,        OPT_EXIT_MA_LEN_MAX        + 1))
+        exit_bm_x10  = int(rng.integers(OPT_EXIT_BAND_MULT_X10_MIN, OPT_EXIT_BAND_MULT_X10_MAX + 1))
+        adx_int      = int(rng.integers(OPT_ADX_MIN,                OPT_ADX_MAX                + 1))
+        rsi_lo_int   = int(rng.integers(OPT_RSI_LO_MIN,             OPT_RSI_LO_MAX             + 1))
+        band_ema     = int(rng.integers(OPT_BAND_EMA_MIN,           OPT_BAND_EMA_MAX           + 1))
+        adx_period   = int(rng.integers(OPT_ADX_PERIOD_MIN,         OPT_ADX_PERIOD_MAX         + 1))
+        rsi_period   = int(rng.integers(OPT_RSI_PERIOD_MIN,         OPT_RSI_PERIOD_MAX         + 1))
+        lev_int      = int(OPT_LEVERAGE_VALUES[int(rng.integers(0, len(OPT_LEVERAGE_VALUES)))])
+        key = (ma, bm_x10, trail_x10000, exit_ma, exit_bm_x10,
                adx_int, rsi_lo_int, band_ema, adx_period, rsi_period, lev_int)
         if key not in seen:
             seen.add(key)
@@ -262,8 +258,8 @@ def optimise_params(
               f"BandEMA {OPT_BAND_EMA_MIN}-{OPT_BAND_EMA_MAX}")
         print(f"  Gates    — ADX<{OPT_ADX_MIN}-{OPT_ADX_MAX}  RSI<={OPT_RSI_LO_MIN}-{OPT_RSI_LO_MAX}")
         print(f"  Periods  — ADX {OPT_ADX_PERIOD_MIN}-{OPT_ADX_PERIOD_MAX}  RSI {OPT_RSI_PERIOD_MIN}-{OPT_RSI_PERIOD_MAX}")
-        print(f"  Exit     — TP {OPT_TP_MIN_BP*0.01:.2f}%-{OPT_TP_MAX_BP*0.01:.2f}%  "
-              f"SL {OPT_SL_MIN_BP*0.01:.2f}%-{OPT_SL_MAX_BP*0.01:.2f}%")
+        print(f"  Trail    — {OPT_TRAIL_X10000_MIN/100:.2f}%-{OPT_TRAIL_X10000_MAX/100:.2f}%  "
+              f"(TP fixed={DEFAULT_TP_PCT*100:.0f}%  SL fixed={STOP_LOSS_PCT*100:.0f}%)")
         print(f"  ExitBand — MA-len {OPT_EXIT_MA_LEN_MIN}-{OPT_EXIT_MA_LEN_MAX}  "
               f"BandMult {OPT_EXIT_BAND_MULT_X10_MIN/10:.1f}-{OPT_EXIT_BAND_MULT_X10_MAX/10:.1f}%")
         print(f"  Leverage — {OPT_LEVERAGE_VALUES} (spot margin)")
@@ -300,13 +296,12 @@ def optimise_params(
 
     def _run_trial(combo_entry):
         key, days, offset = combo_entry
-        (ma, bm_x10, tp_bp, sl_bp, exit_ma, exit_bm_x10,
+        (ma, bm_x10, trail_x10000, exit_ma, exit_bm_x10,
          adx_int, rsi_lo_int, band_ema, adx_period, rsi_period, lev_int) = key
 
         band_mult      = bm_x10      / 10.0
         exit_band_mult = exit_bm_x10 / 10.0
-        tp = tp_bp * 0.0001
-        sl = sl_bp * 0.0001
+        trail          = trail_x10000 / 10000.0
 
         # Slice the random window for this trial
         n_candles = int(days * 1440.0 / max(interval_minutes, 1))
@@ -326,8 +321,9 @@ def optimise_params(
             rsi_period=rsi_period,
         )
         xp = ExitParams(
-            tp_pct=tp,
-            sl_pct=sl,
+            tp_pct=DEFAULT_TP_PCT,
+            sl_pct=STOP_LOSS_PCT,
+            trail_pct=trail,
             exit_ma_len=exit_ma,
             exit_band_mult=exit_band_mult,
             leverage=float(lev_int),
@@ -338,14 +334,14 @@ def optimise_params(
             interval_minutes_bt=interval_minutes,
             borrow_hourly_rate=borrow_hourly_rate,
         )
-        return (key, days, band_mult, exit_band_mult, tp, sl, res)
+        return (key, days, band_mult, exit_band_mult, trail, res)
 
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         futures = {executor.submit(_run_trial, ce): ce for ce in combos}
         for future in as_completed(futures):
             try:
-                (key, days, band_mult, exit_band_mult, tp, sl, res) = future.result()
-                (ma, bm_x10, tp_bp, sl_bp, exit_ma, exit_bm_x10,
+                (key, days, band_mult, exit_band_mult, trail, res) = future.result()
+                (ma, bm_x10, trail_x10000, exit_ma, exit_bm_x10,
                  adx_int, rsi_lo_int, band_ema, adx_period, rsi_period, lev_int) = key
             except Exception as _exc:
                 log.debug(f"[OPT] Trial raised: {_exc}")
@@ -384,8 +380,9 @@ def optimise_params(
                 "band_ema_len":     band_ema,
                 "adx_period":       adx_period,
                 "rsi_period":       rsi_period,
-                "tp_pct":           tp,
-                "sl_pct":           sl,
+                "tp_pct":           DEFAULT_TP_PCT,
+                "sl_pct":           STOP_LOSS_PCT,
+                "trail_pct":        trail,
                 "exit_ma_len":      exit_ma,
                 "exit_band_mult":   exit_band_mult,
                 "leverage":         float(lev_int),
@@ -430,8 +427,9 @@ def optimise_params(
         rsi_period=best["rsi_period"],
     )
     best_exit = ExitParams(
-        tp_pct=best["tp_pct"],
-        sl_pct=best["sl_pct"],
+        tp_pct=DEFAULT_TP_PCT,
+        sl_pct=STOP_LOSS_PCT,
+        trail_pct=best["trail_pct"],
         exit_ma_len=best["exit_ma_len"],
         exit_band_mult=best["exit_band_mult"],
         leverage=best["leverage"],
@@ -447,8 +445,8 @@ def optimise_params(
             f"  Gates    — ADX<{best_entry.adx_threshold:.0f}  RSI<={best_entry.rsi_neutral_lo:.0f}\n"
             f"  Periods  — ADX({best_entry.adx_period})  RSI({best_entry.rsi_period})\n"
             f"  ExitBand — MA-len={best_exit.exit_ma_len}  BandMult={best_exit.exit_band_mult:.2f}%\n"
-            f"  TP={best_exit.tp_pct*100:.2f}%  SL={best_exit.sl_pct*100:.2f}%  "
-            f"Leverage={best_exit.leverage:.0f}×\n"
+            f"  Trail={best_exit.trail_pct*100:.3f}%  TP={best_exit.tp_pct*100:.0f}% (fixed)  "
+            f"SL={best_exit.sl_pct*100:.0f}% (fixed)  Leverage={best_exit.leverage:.0f}×\n"
             f"  Wins={best['n_wins']}  Losses={best['n_losses']}  WinRate={best['win_rate']:.1f}%  "
             f"PF={pf_str}  Return={best['return_pct']:.2f}%  Trades={best['trades']}\n"
             f"  Hold     — Avg={best['avg_hold_minutes']:.0f}m  "

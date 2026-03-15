@@ -40,6 +40,7 @@ from ..utils.constants import (
     TIME_TP_SCALE,
     SIGNAL_DROUGHT_HOURS,
     MAX_LOSS_PCT,
+    HARD_SL_PAUSE_HOURS,
     CANDLE_INTERVALS,
     SYMBOLS,
 )
@@ -133,6 +134,7 @@ class LiveRealTrader:
         self._last_entry_fee: float = 0.0  # entry fee stored for accurate exit PnL
         self._reopt_running: bool = False  # guard against concurrent reopt threads
         self._time_tp_applied: bool = False  # True once time-based TP tightening fires
+        self._sl_pause_until: Optional[float] = None  # epoch when hard-SL cooldown expires
         self._shadow_positions: list = []  # virtual "what if" trades for gate-blocked signals
         self._traders_ref: Optional[Dict] = None  # set by caller; used for interval-switching at re-opt
 
@@ -423,6 +425,22 @@ class LiveRealTrader:
             self._last_entry_fee        = 0.0
             self._time_tp_applied       = False
             self._max_high_since_entry  = None   # McIntosh trail reset
+
+            # ── Hard-SL cooldown: pause entries for HARD_SL_PAUSE_HOURS ──────
+            if reason == "STOP_LOSS":
+                self._sl_pause_until = time.time() + HARD_SL_PAUSE_HOURS * 3600.0
+                self.last_reopt_time = 0.0   # force immediate re-optimisation
+                log.warning(
+                    f"[{ts_utc}] STOP_LOSS fired — entries paused for "
+                    f"{HARD_SL_PAUSE_HOURS:.0f}h; re-optimisation triggered"
+                )
+                _db.log_event(
+                    ts_utc=ts_utc, level="WARNING", event_type="SL_PAUSE",
+                    symbol=self.symbol,
+                    message=f"Hard SL fired — {HARD_SL_PAUSE_HOURS:.0f}h entry pause + forced reopt",
+                    detail={"pause_until_epoch": self._sl_pause_until,
+                            "hard_sl_pause_hours": HARD_SL_PAUSE_HOURS},
+                )
         except Exception as e:
             log_order(ts_utc=ts_utc, symbol=self.symbol, side="LONG",
                       qty=qty_to_close if qty_to_close else qty_abs,
@@ -705,8 +723,7 @@ class LiveRealTrader:
                                 "band_ema_len":    self.entry_params.band_ema_len,
                                 "adx_period":      self.entry_params.adx_period,
                                 "rsi_period":      self.entry_params.rsi_period,
-                                "tp_pct":          self.exit_params.tp_pct,
-                                "sl_pct":          self.exit_params.sl_pct,
+                                "trail_pct":       self.exit_params.trail_pct,
                                 "exit_ma_len":     self.exit_params.exit_ma_len,
                                 "exit_band_mult":  self.exit_params.exit_band_mult,
                                 "leverage":        self.exit_params.leverage,
@@ -1249,7 +1266,13 @@ class LiveRealTrader:
                 acted = True
 
             # ── Entry logic ──  (never on the same candle as an exit or external close)
-            if not acted and entry_sig and self.position is None and not self._halted:
+            # Clear SL pause once the cooldown window has elapsed
+            if self._sl_pause_until is not None and time.time() >= self._sl_pause_until:
+                log.info(f"[{ts_utc}] Hard-SL cooldown expired — entries re-enabled")
+                self._sl_pause_until = None
+
+            if not acted and entry_sig and self.position is None and not self._halted \
+                    and self._sl_pause_until is None:
                 if self.wallet >= MIN_WALLET_USDT:
                     self._execute_entry(c, ts_utc, ts)
                     # ── Same-bar exit — "Recalculate: After order is filled" (TradingView) ──
@@ -1257,7 +1280,7 @@ class LiveRealTrader:
                     if self.position is not None and self._entry_price is not None:
                         _sb_tp = self._entry_price * (1.0 + float(self.exit_params.tp_pct) * LIVE_TP_SCALE)
                         _sl_sb = self._entry_price * (1.0 - float(self.exit_params.sl_pct))
-                        _sb_trail_high  = self._max_high_since_entry if self._max_high_since_entry else self._entry_price
+                        _sb_trail_high  = max(self._max_high_since_entry, h) if self._max_high_since_entry else h
                         _sb_trail_price = _sb_trail_high * (1.0 - float(self.exit_params.trail_pct))
                         if h >= _sb_tp:
                             self._execute_exit(_sb_tp, "TP", ts_utc)

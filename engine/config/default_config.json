@@ -3,7 +3,7 @@
   "symbol": "XRPUSDT",
   "interval": "5",
   "days_back_seed": 30,
-  "leverage": 3.0,
+  "leverage": 4,
   "starting_wallet": 100.0,
   "fee_rate": 0.00055,
   "maker_fee_rate": 0.0002,
@@ -17,8 +17,8 @@
     "tp_pct": 0.003
   },
   "optimizer": {
-    "n_trials": 4000,
+    "n_trials": 8000,
     "min_trades": 1
   },
-  "risk_pct": 0.8
+  "risk_pct": 0.85
 }

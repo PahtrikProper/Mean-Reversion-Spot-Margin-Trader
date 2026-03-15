@@ -46,7 +46,6 @@ DEFAULT_MA_LEN         = 100    # RMA period for premium (exit) band centre line
 DEFAULT_BAND_MULT      = 2.5    # Premium band width multiplier (%)
 DEFAULT_EXIT_MA_LEN    = 100    # RMA period for discount (entry) band centre line; overrides premium when different
 DEFAULT_EXIT_BAND_MULT = 2.5    # Discount band width multiplier (%)
-DEFAULT_TP_PCT         = 0.003  # 0.30% take-profit (default; now also optimised)
 
 # ── Entry gate defaults (also optimised at runtime) ───────────────────────────
 ADX_THRESHOLD   = 25.0  # ADX must be below this for entry (range-bound regime)
@@ -62,18 +61,23 @@ RSI_PERIOD      = 14    # Wilder's RSI calculation period (optimised at runtime;
 # almost never fires; making it a search dim would add noise without signal.
 VOL_FILTER_MAX_PCT = 0.05   # 5% of candle USDT volume
 
-# ── Hard stop-loss (LONG exit) ────────────────────────────────────────────────
-# Fires when: current_low <= entry_price * (1 - sl_pct)
-# Intentionally wide — designed as a last-resort guard before liquidation.
-# Optimised alongside TP.
-STOP_LOSS_PCT = 0.05     # default 5.0% below entry (optimised at runtime)
+# ── Fixed take-profit (LONG exit) ────────────────────────────────────────────
+# Hard ceiling: exit when price reaches entry × (1 + tp_pct).
+# Fixed — not optimised. Serves as a wide safety cap; the McIntosh trailing
+# stop and band-exit are the primary profit-taking mechanisms.
+STOP_LOSS_PCT = 0.40     # 40.0% below entry (fixed, not optimised)
+DEFAULT_TP_PCT = 0.20    # 20.0% above entry (fixed, not optimised)
 
 # ── McIntosh trailing stop (LONG) ────────────────────────────────────────────
 # Trails the LONG position at max_high_since_entry * (1 - trail_pct).
-# Fires between TP and SL (exit priority 2.5): protects profits when price
-# reverses after rising, while allowing the trade to breathe on the way up.
-# Set to 0.0 to disable; non-zero values are always active for LONG trades.
-TRAIL_STOP_PCT = 0.003   # 0.30% below the highest high seen since entry
+# Fires between TP and hard SL (exit priority 2.5): primary profit-protection.
+# trail_pct is OPTIMISED at runtime — see OPT_TRAIL_PCT_MIN/MAX below.
+TRAIL_STOP_PCT = 0.003   # 0.30% default; overridden by optimiser
+
+# ── Hard-SL cooldown ──────────────────────────────────────────────────────────
+# After a hard stop-loss fires, pause new entries for this many hours, then
+# immediately trigger a fresh re-optimisation before resuming trading.
+HARD_SL_PAUSE_HOURS = 6.0
 
 # ── Optimiser search ranges ───────────────────────────────────────────────────
 INIT_TRIALS          = 4000
@@ -95,38 +99,34 @@ OPT_EXIT_MA_LEN_MAX        = 300
 OPT_EXIT_BAND_MULT_X10_MIN = 3    # 0.3%
 OPT_EXIT_BAND_MULT_X10_MAX = 100  # 10.0%
 
-# Take-profit (in basis points, 1 bp = 0.0001; 20 = 0.20%, 100 = 1.00%)
-# Data-driven range: ATR% medians are 0.19–0.41% across intervals → 20–100 bp
-OPT_TP_MIN_BP       = 20    # 0.20% price move (1× ATR on 3-min)
-OPT_TP_MAX_BP       = 100   # 1.00% price move (2.5× ATR on 15-min)
+# McIntosh trail percentage (integer × 10000: 10 = 0.10%, 500 = 5.00%)
+OPT_TRAIL_X10000_MIN = 10    # 0.10% minimum trail distance from peak
+OPT_TRAIL_X10000_MAX = 500   # 5.00% maximum trail distance from peak
 
-# Stop-loss (in basis points; 50 = 0.50%, 900 = 9.00%)
-# Upper bound intentionally below the minimum liquidation distance at max leverage
-# (10× → liq = entry × 9 / 9.95 ≈ 9.55% below entry) so SL always fires before liquidation.
-OPT_SL_MIN_BP       = 50    # 0.50% below entry
-OPT_SL_MAX_BP       = 900   # 9.00% below entry
+# ADX gate threshold (integer; lower = more permissive, higher = stricter)
+# Data-driven (5-min XRPUSDT): p10=19.8, p25=24.7, p50=32.9, p75=43.4, p90=55.3
+# Previous max of 28 was below the empirical median — expanded to cover full distribution.
+OPT_ADX_MIN         = 15
+OPT_ADX_MAX         = 55
 
-# ADX gate threshold (integer; 20 = most permissive, 28 = strictest in tested range)
-# Data-driven: 3-min p50=25.13, 5-min p50=20.51, 15-min p50=23.33
-OPT_ADX_MIN         = 20
-OPT_ADX_MAX         = 28
+# RSI neutral-low threshold (integer; lower = more permissive, higher = stricter)
+# Data-driven (5-min XRPUSDT): p10=34.3, p25=41.4, p50=49.6, p75=57.4, p90=65.2
+OPT_RSI_LO_MIN      = 30
+OPT_RSI_LO_MAX      = 70
 
-# RSI neutral-low threshold (integer; 40 = most permissive, 60 = strictest)
-# Data-driven: RSI p25=41, p75=60 across all intervals
-OPT_RSI_LO_MIN      = 40
-OPT_RSI_LO_MAX      = 60
-
-# Band EMA smoothing length (integer; 2 = most responsive, 15 = smoothest)
+# Band EMA smoothing length (integer; 2 = most responsive, 25 = smoothest)
 OPT_BAND_EMA_MIN    = 2
-OPT_BAND_EMA_MAX    = 15
+OPT_BAND_EMA_MAX    = 25
 
-# ADX calculation period (integer; 7 = sensitive, 21 = smooth)
-OPT_ADX_PERIOD_MIN  = 7
-OPT_ADX_PERIOD_MAX  = 21
+# ADX calculation period (integer; 5 = very sensitive, 28 = smooth/long-term)
+# Standard Wilder ADX = 14; short-term scalping: 7–10; longer-term swing: 20–28
+OPT_ADX_PERIOD_MIN  = 5
+OPT_ADX_PERIOD_MAX  = 28
 
-# RSI calculation period (integer; 7 = sensitive, 21 = smooth)
-OPT_RSI_PERIOD_MIN  = 7
-OPT_RSI_PERIOD_MAX  = 21
+# RSI calculation period (integer; 5 = very sensitive, 28 = smooth)
+# Standard Wilder RSI = 14; commonly varied between 7 and 28
+OPT_RSI_PERIOD_MIN  = 5
+OPT_RSI_PERIOD_MAX  = 28
 
 # Leverage — discrete spot margin values tested by the optimizer
 # Bybit spot margin supports: 2×, 3×, 4×, 8×, 10×
@@ -158,15 +158,14 @@ RANDOM_SEED       = None     # set int for reproducible runs
 EXPLOIT_RATIO                     = 0.60
 EXPLOIT_MA_LEN_RADIUS             = 15
 EXPLOIT_BAND_MULT_RADIUS_X10      = 3    # ±0.3 around saved best entry band_mult
-EXPLOIT_TP_RADIUS_BP              = 15   # ±0.15% around saved best TP (range is 0.20–1.00%)
-EXPLOIT_SL_RADIUS_BP              = 50   # ±0.50% around saved best SL
+EXPLOIT_TRAIL_RADIUS_X10000       = 20   # ±0.20% around saved best trail_pct
 EXPLOIT_EXIT_MA_LEN_RADIUS        = 15
 EXPLOIT_EXIT_BAND_MULT_RADIUS_X10 = 3    # ±0.3 around saved best exit band_mult
-EXPLOIT_ADX_RADIUS                = 2    # ±2 around saved best ADX threshold
-EXPLOIT_RSI_LO_RADIUS             = 5    # ±5 around saved best RSI neutral-low
-EXPLOIT_BAND_EMA_RADIUS           = 2    # ±2 around saved best band EMA length
-EXPLOIT_ADX_PERIOD_RADIUS         = 2    # ±2 around saved best ADX period
-EXPLOIT_RSI_PERIOD_RADIUS         = 2    # ±2 around saved best RSI period
+EXPLOIT_ADX_RADIUS                = 5    # ±5 around saved best ADX threshold (range 15–55)
+EXPLOIT_RSI_LO_RADIUS             = 7    # ±7 around saved best RSI neutral-low (range 30–70)
+EXPLOIT_BAND_EMA_RADIUS           = 3    # ±3 around saved best band EMA length (range 2–25)
+EXPLOIT_ADX_PERIOD_RADIUS         = 3    # ±3 around saved best ADX period (range 5–28)
+EXPLOIT_RSI_PERIOD_RADIUS         = 3    # ±3 around saved best RSI period (range 5–28)
 EXPLOIT_LEVERAGE_RADIUS           = 1    # explore ±1 step in OPT_LEVERAGE_VALUES list
 
 # ── Runtime behaviour ─────────────────────────────────────────────────────────
