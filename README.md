@@ -1,6 +1,6 @@
 # Mean Reversion Trader
 
-An automated SHORT-only mean-reversion trading bot for Bybit USDT linear perpetuals. Fades overextended price moves using EMA-smoothed premium bands, with an integrated parameter optimiser that re-tunes itself every 12 hours.
+An automated LONG-only spot margin mean-reversion trading bot for Bybit. Buys bounces off EMA-smoothed discount bands below the RMA centre line, with an integrated parameter optimiser that re-tunes itself every 12 hours.
 
 Symbols, leverage, intervals, and all strategy parameters are fully configurable — either through the GUI settings panel, a JSON config file, or `engine/utils/constants.py`.
 
@@ -80,8 +80,7 @@ Mean Reversion Trader/
     ├── trading/
     │   ├── bybit_client.py      # Bybit REST + WebSocket client
     │   ├── live_trader.py       # Live trading engine
-    │   ├── paper_trader.py      # Paper trading engine
-    │   └── liquidation.py       # Bybit isolated SHORT liquidation formula
+    │   └── paper_trader.py      # Paper trading engine
     ├── utils/
     │   ├── api_key_prompt.py    # Interactive API credential setup
     │   ├── constants.py         # All configuration constants
@@ -116,7 +115,7 @@ pip install -r requirements.txt
 
 ### 4. Set your Bybit API credentials (live trading only)
 
-The bot needs a Bybit API key with **Derivatives / Contract trading** permissions. Read-only is not sufficient — order placement is required. Paper trading requires no API keys.
+The bot needs a Bybit API key with **Spot trading** permissions. Read-only is not sufficient — order placement is required. Paper trading requires no API keys.
 
 **Option A — environment variables (recommended)**
 
@@ -156,8 +155,8 @@ The GUI is designed to fit a standard 13-inch screen (~1280×832 px) without scr
 | Testing Period | Days of candle history used for optimisation (2–90 days) |
 | Number of Tests | Optimiser trials per symbol/interval pair |
 | Intervals | Candle sizes to test (1m, 3m, 5m, 15m, 30m, 60m) |
-| Symbols | Comma-separated list of Bybit USDT perpetual symbols for **LIVE** mode. Paper mode runs all configured `PAPER_SYMBOLS` (default: XRPUSDT only) independently |
-| Leverage | Initial default leverage (1x–100x). The optimiser searches the range 2–14× and may override this; live mode reads the confirmed setting from Bybit |
+| Symbols | Comma-separated list of Bybit spot margin symbols for **LIVE** mode. Paper mode runs all configured `PAPER_SYMBOLS` (default: XRPUSDT only) independently |
+| Leverage | Initial default leverage. The optimiser searches discrete spot margin values (2×, 3×, 4×, 8×, 10×) and may override this; live mode reads the confirmed setting from Bybit |
 
 Every setting has a dedicated **Apply** button. Changes take effect only when Apply is clicked; they are also locked in automatically when **START** is pressed.
 
@@ -231,7 +230,7 @@ python main.py --paper --max-loss 3
 3. Rank all pairs by score; launch the top-ranked paper trader **for each symbol independently**
 4. All symbol traders run concurrently — each has its own position gate, so they never block one another
 5. Connect to Bybit public WebSocket for live candle data
-6. Simulate fills, PnL, fees, slippage, and liquidation using the exact Bybit formula
+6. Simulate fills, PnL, fees, slippage, and liquidation using the spot margin LONG formula
 7. Virtual starting wallet: **$500 USDT** per symbol
 
 ---
@@ -247,8 +246,8 @@ The chart is read-only — it never writes to the database.
 | Feature | Description |
 |---------|-------------|
 | Candlestick chart | 10 000 candles of OHLCV history with live WebSocket updates |
-| MA + 8 premium/discount bands | RMA centre line and all 8 premium (entry) and discount (exit) bands overlaid |
-| Live/paper trade markers | Entry → red ▼ arrow; exit → green ▲ arrow. Label shows fill price and result |
+| MA + 8 premium/discount bands | RMA centre line and all 8 discount (entry) and premium (exit) bands overlaid |
+| Live/paper trade markers | Entry → green ▲ arrow; exit → red ▼ arrow. Label shows fill price and result |
 | Backtest trade markers | Semi-transparent circles at entry/exit timestamps from the most recent accepted optimisation run |
 | Loading overlay | Shows "Waiting for first optimisation…" until `candle_analytics` has data; auto-dismisses |
 | Symbol + interval switcher | Dropdown to switch between any (symbol, interval) pair in the DB |
@@ -298,7 +297,7 @@ Place the file anywhere and pass it with `--config`.
 |----------|---------|-------------|
 | `SYMBOLS` | `["XRPUSDT"]` | Active symbols for **LIVE** mode; overridden by the GUI Symbols field or `--symbols` CLI flag. Paper mode uses `PAPER_SYMBOLS` instead |
 | `CANDLE_INTERVALS` | `["1","3","5"]` | Candle sizes (minutes) tested during optimisation |
-| `DEFAULT_LEVERAGE` | `10.0` | Initial fallback leverage (overridden by the 12-dim optimiser on first run) |
+| `DEFAULT_LEVERAGE` | `3.0` | Initial fallback leverage (overridden by the optimiser on first run); spot margin supports 2×, 3×, 4×, 8×, 10× |
 | `STARTING_WALLET` | `100.0` | Simulated wallet used by the backtester and optimiser (not the paper trading wallet) |
 | `PAPER_STARTING_BALANCE` | `500.0` | Virtual wallet size for paper trading (USDT) |
 | `MAX_SYMBOL_FRACTION` | `0.45` | Max wallet fraction used as margin per trade |
@@ -322,23 +321,24 @@ Place the file anywhere and pass it with `--config`.
 
 ## Strategy Summary
 
-**SHORT only — no long trades.**
+**LONG only — no short trades.**
 
-The bot enters short when price touches a premium band above the RMA centre line and then drops back below it (band crossover), signalling a failed breakout. Two gates must pass:
+The bot enters long when price touches a discount band below the RMA centre line and then bounces back above it (band crossover), signalling a mean-reversion recovery. Two gates must pass:
 
 - **ADX < adx_threshold** — market must be range-bound (threshold optimised: 20–28)
-- **RSI ≥ rsi_neutral_lo** — not already deeply oversold (threshold optimised: 40–60)
+- **RSI ≤ rsi_neutral_lo** — close must confirm oversold/neutral (threshold optimised: 40–60)
 
 **Exit priority (strictly ordered):**
 
 | # | Type | Trigger |
 |---|------|---------|
-| 1 | Liquidation | mark price ≥ liquidation price (Bybit isolated formula) |
-| 2 | Take-Profit | price drops to entry × (1 − tp_pct) |
-| 3 | Stop-Loss | high ≥ entry × (1 + sl_pct) — wide guard before liquidation |
-| 4 | Band Exit | low drops below a discount band (mirrors entry logic) |
+| 0 | Liquidation | low ≤ liq_price — spot margin LONG formula: `entry × (lev−1) / (lev × (1−MMR))` |
+| 1 | Trail Stop | low ≤ highest_high_since_entry × (1 − trail_pct) — Jason McIntosh trail (2.0%, fixed) |
+| 2 | Take-Profit | high ≥ entry × (1 + tp_pct) |
+| 3 | Stop-Loss | low ≤ entry × (1 − sl_pct) — wide guard (default 5%) |
+| 4 | Band Exit | high drops below a premium band (mirrors entry logic on the premium side) |
 
-In **live** mode, TP and liquidation are handled server-side by Bybit; stop-loss and band exits are checked on every closed candle. In **paper** mode, all four exits are simulated locally using the exact Bybit liquidation formula with the user-selected leverage. Slippage (1 tick) is applied to all simulated fills.
+In **live** mode, TP is handled server-side by Bybit; trail stop, stop-loss, and band exits are checked on every closed candle. In **paper** mode, all five exits are simulated locally. Slippage (1 tick) is applied to all simulated fills.
 
 ### TradingView Execution Model
 
@@ -441,7 +441,7 @@ python -m pytest tests/ -v
 | Test file | Coverage |
 |-----------|---------|
 | `tests/test_indicators.py` | RMA, EMA, crossover detection, `compute_entry_signals_raw`, `resolve_entry_signals` (ADX/RSI gates) |
-| `tests/test_orders.py` | `apply_slippage()` — SHORT sell and buy cover, zero-tick case |
+| `tests/test_orders.py` | `apply_slippage()` — LONG buy entry and sell exit, zero-tick case |
 | `tests/test_backtester.py` | `backtest_once()` smoke test, flat-market no-liquidation, wallet history, PnL consistency |
 
 No live API calls are made during tests — all fixtures use synthetic OHLCV data.

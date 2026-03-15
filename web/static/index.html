@@ -452,22 +452,22 @@ function _makeMarker(t) {
     // avoid clutter; exits are inferred by the paired ENTRY position.
     return {
       time:     _tsFromUtc(t.ts_utc),
-      position: isEntry ? 'aboveBar' : 'belowBar',
+      position: isEntry ? 'belowBar' : 'aboveBar',
       color:    isEntry ? '#9966aa55' : '#448866aa',
       shape:    'circle',
       size:     0,        // smallest marker
       text:     '',       // no label
     };
   } else {
-    // Bright, labelled arrows for live fills
+    // Bright, labelled arrows for live fills (LONG: buy entry below bar, sell exit above bar)
     return {
       time:     _tsFromUtc(t.ts_utc),
-      position: isEntry ? 'aboveBar' : 'belowBar',
-      color:    isEntry ? '#ef5350'  : '#26a69a',
-      shape:    isEntry ? 'arrowDown' : 'arrowUp',
+      position: isEntry ? 'belowBar' : 'aboveBar',
+      color:    isEntry ? '#26a69a'  : '#ef5350',
+      shape:    isEntry ? 'arrowUp'  : 'arrowDown',
       size:     1,
       text:     isEntry
-        ? `S ${price}`
+        ? `B ${price}`
         : `X ${price}${t.result ? '  ' + t.result : ''}`,
     };
   }

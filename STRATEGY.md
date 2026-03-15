@@ -2,8 +2,8 @@
 
 **Version**: 8.0
 **Package**: `engine/`
-**Instrument**: Bybit USDT linear perpetuals (configurable)
-**Direction**: SHORT only — no long trades exist or should be added
+**Instrument**: Bybit spot margin (CATEGORY = "spot", isLeverage=1)
+**Direction**: LONG only — no short trades exist or should be added
 
 ---
 
@@ -16,7 +16,7 @@ This file defines the exact trading strategy implemented in this codebase.
 
 ## Strategy Overview
 
-A mean-reversion SHORT strategy. It fades price extensions above a moving-average baseline using EMA-smoothed premium bands. The bot enters short when price touches a premium band and then drops back below it (band crossover), confirming the overextension is reversing. It exits when price reaches a discount band on the other side, or via TP / stop-loss.
+A mean-reversion LONG strategy. It buys bounces off EMA-smoothed discount bands below the RMA centre line. The bot enters long when price touches a discount band and then bounces back above it (band crossover), confirming the oversold dip is reversing. It exits when price reaches a premium band on the other side, or via trail stop / TP / stop-loss.
 
 ---
 
@@ -47,19 +47,19 @@ RSI  = RSI(rsi_period)   — Wilder's method (avg_gain / avg_loss via RMA); rsi_
 
 ---
 
-## Entry Signal (SHORT only)
+## Entry Signal (LONG only)
 
 ### Raw Signal
-Scan bands **8 → 1** (most extended first). Fire on the highest band that triggers:
+Scan bands **8 → 1** (most discounted first). Fire on the deepest band that triggers:
 
 ```
 SIGNAL fires when:
-    prev_high >= prev_premium_k   (high was at or above the band last candle)
+    prev_low <= prev_discount_k   (low was at or below the band last candle)
     AND
-    curr_high <  curr_premium_k   (high has dropped back below the band this candle)
+    curr_low >  curr_discount_k   (low has bounced back above the band this candle)
 ```
 
-This is a **band-crossover-above-high**: the premium band crosses above price, meaning price has retreated from the premium zone.
+This is a **band-crossover-below-low**: the discount band crosses below price (from above), meaning price has bounced from the discount zone.
 
 Returns the band level (1–8) that triggered, or 0 for no signal.
 
@@ -69,13 +69,13 @@ Both gates must pass for the signal to be accepted:
 | Gate | Condition to BLOCK entry | Reason |
 |------|--------------------------|--------|
 | ADX  | `ADX >= adx_threshold`   | Trending market — mean reversion unreliable; threshold optimised (20–28) |
-| RSI  | `RSI < rsi_neutral_lo`   | Already deeply oversold — don't fade exhausted moves; threshold optimised (40–60) |
+| RSI  | `RSI > rsi_neutral_lo`   | Overbought close — candle did not confirm an oversold bounce; threshold optimised (40–60) |
 
 ### Implementation
 ```python
 # indicators.py
-compute_entry_signals_raw(current_row, prev_row, current_high, current_low) -> int
-resolve_entry_signals(raw_short, adx, rsi) -> int
+compute_entry_signals_raw(current_row, prev_row, current_low) -> int
+resolve_entry_signals(raw_long, adx, rsi) -> int
 ```
 
 ---
@@ -86,10 +86,11 @@ resolve_entry_signals(raw_short, adx, rsi) -> int
 
 | Priority | Exit Type | Trigger | Notes |
 |----------|-----------|---------|-------|
-| 1 | **Liquidation** | mark_high >= liq_price | Bybit isolated SHORT formula; checked in backtest, detected via position=None in live |
-| 2 | **Take-Profit** | low <= entry * (1 - tp_pct) | Server-side TP in live (Bybit LastPrice trigger); direct check in backtest. After `TIME_TP_HOURS` (20 h) the tighter **data-driven TP** is substituted — reason logged as `TIME_TP` vs `TP` |
-| 3 | **Stop-Loss** | high >= entry * (1 + sl_pct) | Hard stop — wide (default 5%), optimised alongside TP; pre-liquidation guard |
-| 4 | **Band Exit** | discount band crossover-above-low | Mirror of entry signal, on discount bands + low |
+| 0 | **Liquidation** | low <= liq_price | Spot margin LONG formula: `entry × (lev−1) / (lev × (1−MMR))`; checked first in backtest, detected via position=None in live |
+| 1 | **Trail Stop** | low <= highest_high × (1 − trail_pct) | Jason McIntosh trail; tracks highest candle-high since entry; `TRAIL_STOP_PCT = 0.02` (2.0%), fixed constant, never optimised; 0.0 = disabled |
+| 2 | **Take-Profit** | high >= entry × (1 + tp_pct) | Server-side TP in live (Bybit LastPrice trigger); direct check in backtest. After `TIME_TP_HOURS` (20 h) the tighter **data-driven TP** is substituted — reason logged as `TIME_TP` vs `TP` |
+| 3 | **Stop-Loss** | low <= entry × (1 − sl_pct) | Hard floor guard — wide (default 5%), optimised alongside TP |
+| 4 | **Band Exit** | premium band crossover-above-high | Mirror of entry signal applied to premium bands + high |
 
 **This priority order is fixed.** It is implemented identically in the backtester (`backtester.py`), paper trader (`paper_trader.py`), and live trader (`live_trader.py`).
 
@@ -97,20 +98,20 @@ resolve_entry_signals(raw_short, adx, rsi) -> int
 
 After an entry fires on bar N, all four exit conditions are immediately re-evaluated on the **same bar N** before advancing to bar N+1. This matches TradingView's "Recalculate: After order is filled" execution model.
 
-- **Backtester**: full 4-priority pass using bar N's `low_last`, `high_last`, and `mark_high`; `hold_candles = 0` for same-bar exits
-- **Paper trader**: same 4-priority chain re-checked immediately after `_execute_entry()` returns
-- **Live trader**: SL and band exit re-checked immediately after `_execute_entry()` (TP and liquidation are server-side and are picked up via `_handle_external_close` on the next candle)
+- **Backtester**: full 5-priority pass using bar N's `low_last`, `high_last`; `hold_candles = 0` for same-bar exits
+- **Paper trader**: same 5-priority chain re-checked immediately after `_execute_entry()` returns
+- **Live trader**: trail stop, SL and band exit re-checked immediately after `_execute_entry()` (TP is server-side and liquidation is detected via `_handle_external_close` on the next candle)
 
 This behaviour is gated by `entry_candle_idx == i` (backtester) and `self.position is not None` after `_execute_entry` (paper/live).
 
 ### Band Exit Detail
 ```
 Exit fires when:
-    prev_low >= prev_discount_k   (low was at or above the band last candle)
+    prev_high >= prev_premium_k   (high was at or above the band last candle)
     AND
-    curr_low <  curr_discount_k   (low has dropped below the band this candle)
+    curr_high <  curr_premium_k   (high has dropped back below the band this candle)
 ```
-Same `crossover()` function as entry, applied to discount bands + LOW. No gates — exits are unconditional on band signal.
+Same `crossover()` function as entry, applied to premium bands + HIGH. No gates — exits are unconditional on band signal.
 
 ```python
 # indicators.py
@@ -143,12 +144,14 @@ compute_exit_signals_raw(current_row, prev_row, current_low, current_high) -> in
 | `exit_band_mult` | `ExitParams` | 2.5 | 0.3 – 10.0 % (stored ×10 as int during search) |
 | `tp_pct` | `ExitParams` | 0.003 | 20 – 100 bp × 0.0001 (0.20% – 1.00%) |
 | `sl_pct` | `ExitParams` | 0.05 | 50 – 900 bp × 0.0001 (0.50% – 9.00%) |
-| `leverage` | `ExitParams` | 10.0 | 2 – 14 (int) |
+| `leverage` | `ExitParams` | 3.0 | discrete: 2, 3, 4, 8, 10 (Bybit spot margin values) |
 
 ### Fixed Constants (never optimised)
 
 | Constant | Value | Location |
 |----------|-------|----------|
+| `TRAIL_STOP_PCT` | 2.0 % | `constants.py` — trailing stop fires when low <= highest_high × (1 − 0.02); set to 0.0 to disable |
+| `SPOT_MARGIN_MMR` | 0.5 % | `constants.py` — maintenance margin rate used in liquidation price formula |
 | `VOL_FILTER_MAX_PCT` | 5.0 % | `constants.py` — skip entry if position notional > 5% of candle USDT volume |
 | `LIVE_TP_SCALE` | 1.0 | `constants.py` — server TP matches backtested distance exactly |
 | `SIGNAL_DROUGHT_HOURS` | 4.0 | `constants.py` |
@@ -214,13 +217,12 @@ The optimiser runs trials in parallel using `ThreadPoolExecutor` (up to `min(cpu
 ## Live Trading Architecture
 
 ### Data Sources
-- **Last-price klines** (`/v5/market/kline`): used for all signal generation, TP, stop-loss, and band exit
-- **Mark-price klines** (`/v5/market/mark-price-kline`): used only for liquidation price checks
-- **Bybit WebSocket** (`wss://stream.bybit.com/v5/public/linear`): live candle stream (`kline.<interval>.<symbol>`) and mark price stream (`tickers.<symbol>`)
+- **Last-price klines** (`/v5/market/kline`): used for all signal generation, TP, stop-loss, trail stop, and band exit
+- **Bybit WebSocket** (`wss://stream.bybit.com/v5/public/spot`): live candle stream (`kline.<interval>.<symbol>`) and ticker stream (`tickers.<symbol>`)
 
 ### Order Types
-- **Entry**: IOC market order (`place_market_order`, side=Sell)
-- **Exit**: IOC market order (`place_market_order`, side=Buy, reduceOnly=True)
+- **Entry**: IOC market order (`place_market_order`, side=Buy, isLeverage=1 — activates spot margin borrowing)
+- **Exit**: IOC market order (`place_market_order`, side=Sell — no reduceOnly for spot)
 - **Take-Profit**: Server-side via `set_trading_stop` (LastPrice trigger, tpslMode=Full)
 
 ### Warm-Up Period
@@ -249,19 +251,16 @@ No signals are generated until this many candles have been received.
 | Gate release guarantee | `_execute_exit()` releases the `PositionGate` in a `finally` block unconditionally |
 
 ### Signal Drought Detection
-After every closed candle, if no raw band crossover (`_raw_short > 0`) has been seen for `SIGNAL_DROUGHT_HOURS` (4.0 h), a `SIGNAL_DROUGHT` WARNING event is logged to the DB and the status monitor prints a WARNING banner. A cooldown prevents duplicate events within the same drought window.
+After every closed candle, if no raw band crossover (`_raw_long > 0`) has been seen for `SIGNAL_DROUGHT_HOURS` (4.0 h), a `SIGNAL_DROUGHT` WARNING event is logged to the DB and the status monitor prints a WARNING banner. A cooldown prevents duplicate events within the same drought window.
 
 ### Max-Loss Halt (`--max-loss`)
 When `MAX_LOSS_PCT` is set (via `--max-loss N` CLI flag), the bot monitors session P&L on every candle. If session PnL drops below `-MAX_LOSS_PCT%`: any open position is exited immediately, a `MAX_LOSS_HALT` event is logged, and new entries are blocked for **4 hours**. The halt auto-expires — normal trading resumes after the 4-hour window.
 
-### Liquidation Formula (SHORT, isolated margin, USDT linear)
+### Liquidation Formula (LONG, spot margin)
 ```
-LP = Entry + (IM + ExtraMargin - MM) / |Qty|
-
- IM  = |Qty| × Entry / Leverage          (entry-price based)
- MM  = max(0, |Qty| × Mark × MMR - mmDeduction + |Qty| × Mark × fee_rate)
+liq_price = entry × (leverage − 1) / (leverage × (1 − MMR))
 ```
-Tier (MMR, mmDeduction) is selected from Bybit's risk-limit table based on position value at mark price.
+`MMR = SPOT_MARGIN_MMR = 0.005` (0.5%). A trade is liquidated in the backtester when `low <= liq_price`; in live trading it is detected when the position disappears from Bybit.
 
 ---
 
@@ -271,8 +270,8 @@ Paper trading uses `PaperTrader` (`paper_trader.py`) instead of `LiveRealTrader`
 
 - No API keys required — uses public REST and WebSocket only
 - Virtual wallet starts at `PAPER_STARTING_BALANCE` (default **$500 USDT**)
-- All four exit types are simulated locally (liquidation, TP, stop-loss, band)
-- Same-bar exit re-check ("After order is filled") implemented — all four exits checked on entry bar
+- All five exit types are simulated locally (liquidation, trail stop, TP, stop-loss, band)
+- Same-bar exit re-check ("After order is filled") implemented — all five exits checked on entry bar
 - Slippage (`SLIPPAGE_TICKS = 1`) applied to all fills via `apply_slippage()` in `orders.py`
 - Taker and maker fees both simulated using per-symbol fee lookups from `helpers.py`
 - After each accepted re-optimisation, backtest trades are written to the `trades` table (`mode='backtest'`) via `bulk_log_backtest_trades()` for chart visualisation
@@ -281,9 +280,9 @@ Paper trading uses `PaperTrader` (`paper_trader.py`) instead of `LiveRealTrader`
 
 ## Key Invariants — Do Not Change Without Explicit Instruction
 
-1. **SHORT only.** No long entries. No flip logic.
-2. **Exit priority is fixed**: Liquidation → TP → Stop-Loss → Band. This must be identical in `backtester.py`, `paper_trader.py`, and `live_trader.py`. The same-bar re-check after entry must preserve the same priority order.
-3. **Hard stop-loss only.** `sl_pct` is optimised alongside `tp_pct`. No trail stop.
+1. **LONG only.** No short entries. No flip logic.
+2. **Exit priority is fixed**: Liquidation → Trail Stop → TP → Stop-Loss → Band. This must be identical in `backtester.py`, `paper_trader.py`, and `live_trader.py`. The same-bar re-check after entry must preserve the same priority order.
+3. **Trail stop + hard stop-loss.** `TRAIL_STOP_PCT` (2.0%) is a fixed constant, never optimised. `sl_pct` is optimised alongside `tp_pct` as a hard-floor guard below the trail.
 4. **Band EMA length is optimised (2–15).** `band_ema_len` is a search dimension, not a fixed constant.
 5. **ADX threshold (20–28), RSI threshold (40–60), ADX period (7–21), and RSI period (7–21) are all optimised.** Do not treat them as fixed constants.
 6. **The optimiser sorts internally by (n_losses ASC, return_pct DESC).** Pair selection uses `pnl_pct / (1 + max_drawdown_pct)`. Do not conflate these two scoring steps.
@@ -291,7 +290,7 @@ Paper trading uses `PaperTrader` (`paper_trader.py`) instead of `LiveRealTrader`
 8. **`_maybe_reoptimise` must never block the WebSocket thread.** It spawns `_run_reoptimise` as a daemon thread.
 9. **Gate must always be released when a position closes**, including on early returns and exceptions inside `_execute_exit`.
 10. **`LIVE_TP_SCALE = 1.0`** — the server-side TP is placed at exactly the backtested distance (no scaling).
-11. **`SLIPPAGE_TICKS = 1`** — applies to paper/backtest fills only; live fills rely on Bybit execution.
+11. **`SLIPPAGE_TICKS = 1`** — applies to paper/backtest fills only; live fills rely on Bybit execution. LONG buy entry receives `price + tick`; sell exit receives `price − tick`.
 12. **Data-driven time TP** — after `TIME_TP_HOURS` (20 h) of holding, `compute_time_tp_pct()` queries the top-3 profitable 20h+ exits from the DB, averages their TP%, scales by `TIME_TP_SCALE` (0.75), and substitutes the result as the active TP. Falls back to `TIME_TP_FALLBACK_PCT` (0.5%) if fewer than 3 qualifying trades exist. Exit reason is `TIME_TP` (not `TP`) when this fires.
 13. **SQLite only — no CSV or log files.** All trade data, signals, orders, optimisation runs, events, and diagnostics are written exclusively to `data/trading.db`. `csv_append` and `ensure_csv` in `logger.py` are permanent no-ops.
 14. **DB maintenance runs automatically.** `run_maintenance()` is called at startup (no VACUUM) and every 24 hours (full VACUUM) by a daemon thread in `main.py`. Each table has a defined retention period; stale rows are pruned before the WAL checkpoint and ANALYZE pass.
@@ -312,7 +311,6 @@ Paper trading uses `PaperTrader` (`paper_trader.py`) instead of `LiveRealTrader`
 | `engine/trading/live_trader.py` | Live trading engine: WebSocket candle processing, entry/exit execution, re-optimisation |
 | `engine/trading/paper_trader.py` | Paper trading engine: simulates fills, fees, slippage, liquidation locally using public data |
 | `engine/trading/bybit_client.py` | Bybit REST + WebSocket client, order placement, execution polling |
-| `engine/trading/liquidation.py` | Exact Bybit isolated SHORT liquidation price formula |
 | `engine/utils/api_key_prompt.py` | Interactive API credential setup with hidden input; saves/loads `~/.bybit_credentials.json` |
 | `engine/utils/constants.py` | All configuration constants and defaults |
 | `engine/utils/data_structures.py` | `EntryParams`, `ExitParams`, `TradeRecord` (includes `entry_ts_ms`/`exit_ts_ms` for chart marker placement), `BacktestResult`, `MCSimResult`, `RealPosition`, `PendingSignal` |
