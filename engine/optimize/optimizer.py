@@ -67,6 +67,7 @@ from ..utils.constants import (
     OPT_MIN_DAYS,               OPT_MAX_DAYS,
     OPT_N_RANDOM,
     OPT_MIN_TRADES,
+    OPT_MIN_TRADES_PER_DAY,
     RANDOM_SEED,
     EXPLOIT_RATIO,
     EXPLOIT_MA_LEN_RADIUS,
@@ -268,7 +269,8 @@ def optimise_params(
             print(f"  Mode: {n_exploit} exploitation + {len(combos)-n_exploit} exploration")
         else:
             print(f"  Mode: {total} fully random")
-        print(f"  Min trades filter: {OPT_MIN_TRADES}\n")
+        print(f"  Min trades filter: ≥{OPT_MIN_TRADES_PER_DAY:.1f}/day  "
+              f"(≥{max(OPT_MIN_TRADES, int(OPT_MAX_DAYS * OPT_MIN_TRADES_PER_DAY))} over {OPT_MAX_DAYS}d)\n")
 
     _run_id    = str(uuid.uuid4())
     _t_start   = time.time()
@@ -359,7 +361,12 @@ def optimise_params(
                 except Exception:
                     pass
 
-            if res is None or res.liquidated or res.trades < OPT_MIN_TRADES:
+            # Absolute minimum + per-day minimum trade frequency gate
+            min_required = max(
+                OPT_MIN_TRADES,
+                int(days * OPT_MIN_TRADES_PER_DAY),
+            )
+            if res is None or res.liquidated or res.trades < min_required:
                 continue
 
             wins      = [t for t in res.trade_records if t.pnl_net > 0]

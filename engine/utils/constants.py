@@ -87,9 +87,12 @@ REOPT_INTERVAL_SEC   = 12 * 60 * 60  # re-optimise every 12 hours
 OPT_MA_LEN_MIN        = 2
 OPT_MA_LEN_MAX        = 300
 
-# Entry — Band multiplier (stored as integer × 10: 3 = 0.3, 100 = 10.0)
+# Entry — Band multiplier (stored as integer × 10: 3 = 0.3, 30 = 3.0)
+# Data-driven cap: on XRPUSDT 5m, band_mult > 3.0% produces zero entry signals
+# over a 30-day window.  Keeping max at 3.0% ensures the optimizer always finds
+# param sets that generate at least some trades.
 OPT_BAND_MULT_X10_MIN = 3    # 0.3%
-OPT_BAND_MULT_X10_MAX = 100  # 10.0%
+OPT_BAND_MULT_X10_MAX = 30   # 3.0%  (was 100 / 10.0% — zero signals above ~3%)
 
 # Exit — MA length (RMA period for discount band centre line; independent of entry)
 OPT_EXIT_MA_LEN_MIN        = 2
@@ -97,7 +100,7 @@ OPT_EXIT_MA_LEN_MAX        = 300
 
 # Exit — Band multiplier (stored as integer × 10; independent of entry)
 OPT_EXIT_BAND_MULT_X10_MIN = 3    # 0.3%
-OPT_EXIT_BAND_MULT_X10_MAX = 100  # 10.0%
+OPT_EXIT_BAND_MULT_X10_MAX = 30   # 3.0%  (capped in line with entry band)
 
 # McIntosh trail percentage (integer × 10000: 10 = 0.10%, 500 = 5.00%)
 OPT_TRAIL_X10000_MIN = 10    # 0.10% minimum trail distance from peak
@@ -149,8 +152,9 @@ BORROW_HOURLY_RATE  = 0.0001   # 0.01% per hour (default fallback)
 OPT_MIN_DAYS        = 30
 OPT_MAX_DAYS        = 30
 
-OPT_N_RANDOM      = INIT_TRIALS
-OPT_MIN_TRADES    = 1
+OPT_N_RANDOM          = INIT_TRIALS
+OPT_MIN_TRADES_PER_DAY = 1.0   # discard any trial with < 1 trade/day on average
+OPT_MIN_TRADES        = 1      # absolute floor (kept for very short windows)
 
 RANDOM_SEED       = None     # set int for reproducible runs
 
