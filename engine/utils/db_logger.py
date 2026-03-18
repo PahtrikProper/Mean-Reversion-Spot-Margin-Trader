@@ -411,12 +411,20 @@ def _create_tables() -> None:
         id               INTEGER PRIMARY KEY AUTOINCREMENT,
         run_id           TEXT    NOT NULL,
         trial_num        INTEGER,
+        -- Entry params (full set — needed to seed future optimizer runs)
         ma_len           INTEGER,
         band_mult        REAL,
         tp_pct           REAL,
+        adx_threshold    REAL,
+        rsi_neutral_lo   REAL,
+        band_ema_len     INTEGER,
+        trail_pct        REAL,
+        exit_ma_len      INTEGER,
+        exit_band_mult   REAL,
         adx_period       INTEGER,
         rsi_period       INTEGER,
         leverage         REAL,
+        -- Performance metrics
         days_tested      INTEGER,
         trades           INTEGER,
         n_wins           INTEGER,
@@ -534,6 +542,25 @@ def _create_tables() -> None:
             _conn.execute(f"ALTER TABLE params ADD COLUMN {_col} {_typ}")
         except sqlite3.OperationalError:
             pass  # column already exists
+
+    # ── Migrate optimization_trials — add full param columns if missing ────────
+    # Previous schema only stored ma_len, band_mult, tp_pct, adx_period,
+    # rsi_period, leverage — the remaining 6 dimensions are needed to fully
+    # reconstruct winning parameter sets for seeding future optimizer runs.
+    _trials_new_cols = [
+        ("adx_threshold",  "REAL"),
+        ("rsi_neutral_lo", "REAL"),
+        ("band_ema_len",   "INTEGER"),
+        ("trail_pct",      "REAL"),
+        ("exit_ma_len",    "INTEGER"),
+        ("exit_band_mult", "REAL"),
+    ]
+    for _col, _typ in _trials_new_cols:
+        try:
+            _conn.execute(f"ALTER TABLE optimization_trials ADD COLUMN {_col} {_typ}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
     _conn.commit()
 
 
@@ -1133,7 +1160,7 @@ def log_optimization_run(
 
 
 def log_optimization_trials(run_id: str, results: List[dict]) -> None:
-    """Bulk-insert all valid optimizer trial results."""
+    """Bulk-insert all valid optimizer trial results (full parameter set)."""
     rows = []
     for i, r in enumerate(results, 1):
         pf = r.get("profit_factor", 0.0)
@@ -1142,6 +1169,10 @@ def log_optimization_trials(run_id: str, results: List[dict]) -> None:
         rows.append((
             run_id, i,
             r.get("ma_len"), _safe(r.get("band_mult")), _safe(r.get("tp_pct")),
+            _safe(r.get("adx_threshold")), _safe(r.get("rsi_neutral_lo")),
+            r.get("band_ema_len"),
+            _safe(r.get("trail_pct")),
+            r.get("exit_ma_len"), _safe(r.get("exit_band_mult")),
             r.get("adx_period"), r.get("rsi_period"), _safe(r.get("leverage")),
             r.get("days_tested"),
             r.get("trades"), r.get("n_wins"), r.get("n_losses"),
@@ -1154,15 +1185,75 @@ def log_optimization_trials(run_id: str, results: List[dict]) -> None:
         """INSERT INTO optimization_trials (
             run_id, trial_num,
             ma_len, band_mult, tp_pct,
+            adx_threshold, rsi_neutral_lo, band_ema_len,
+            trail_pct, exit_ma_len, exit_band_mult,
             adx_period, rsi_period, leverage, days_tested,
             trades, n_wins, n_losses,
             win_rate, profit_factor,
             return_pct, pnl_usdt,
             avg_win, avg_loss,
             max_drawdown_pct, sharpe
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         rows,
     )
+
+
+def load_top_trial_params(
+    symbol: str,
+    interval: str,
+    limit: int = 5,
+) -> List[dict]:
+    """Return the top *limit* winning trial parameter sets for the given
+    symbol/interval pair, ordered by (n_losses ASC, sharpe DESC, return_pct DESC).
+
+    Only rows that contain the full parameter set (adx_threshold not NULL)
+    are returned — older rows logged before the schema migration are skipped.
+
+    Returns a list of dicts suitable for passing to ``optimise_params()`` as
+    the ``historical_winners`` argument.  Returns an empty list when the DB
+    has no data or is not yet initialised.
+    """
+    if _conn is None:
+        return []
+    try:
+        with _lock:
+            rows = _conn.execute(
+                """
+                SELECT t.ma_len, t.band_mult, t.adx_threshold, t.rsi_neutral_lo,
+                       t.band_ema_len, t.trail_pct, t.exit_ma_len, t.exit_band_mult,
+                       t.adx_period, t.rsi_period, t.leverage
+                FROM   optimization_trials t
+                INNER  JOIN optimization_runs r ON r.run_id = t.run_id
+                WHERE  r.symbol   = ?
+                  AND  r.interval = ?
+                  AND  t.adx_threshold IS NOT NULL
+                  AND  t.trail_pct     IS NOT NULL
+                  AND  t.exit_ma_len   IS NOT NULL
+                ORDER  BY t.n_losses ASC, t.sharpe DESC, t.return_pct DESC
+                LIMIT  ?
+                """,
+                (symbol, interval, limit),
+            ).fetchall()
+        return [
+            {
+                "ma_len":         r["ma_len"],
+                "band_mult":      r["band_mult"],
+                "adx_threshold":  r["adx_threshold"],
+                "rsi_neutral_lo": r["rsi_neutral_lo"],
+                "band_ema_len":   r["band_ema_len"],
+                "trail_pct":      r["trail_pct"],
+                "exit_ma_len":    r["exit_ma_len"],
+                "exit_band_mult": r["exit_band_mult"],
+                "adx_period":     r["adx_period"],
+                "rsi_period":     r["rsi_period"],
+                "leverage":       r["leverage"],
+            }
+            for r in rows
+            if r["ma_len"] is not None
+        ]
+    except Exception as exc:
+        log.warning(f"[DB] load_top_trial_params failed: {exc}")
+        return []
 
 
 def log_monte_carlo(

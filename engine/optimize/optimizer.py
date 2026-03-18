@@ -70,6 +70,7 @@ from ..utils.constants import (
     OPT_N_RANDOM,
     OPT_MIN_TRADES,
     OPT_MIN_TRADES_PER_DAY,
+    OPT_HISTORICAL_WINNERS,
     RANDOM_SEED,
     EXPLOIT_RATIO,
     EXPLOIT_MA_LEN_RADIUS,
@@ -104,6 +105,7 @@ def optimise_params(
     fee_rate: float,
     interval_minutes: int = 5,
     saved_best: Optional[Dict[str, Any]] = None,
+    historical_winners: Optional[list] = None,
     progress_callback=None,
     verbose: bool = True,
     db_symbol: Optional[str] = None,
@@ -120,6 +122,15 @@ def optimise_params(
 
     Per-trial: random contiguous window of OPT_MIN_DAYS–OPT_MAX_DAYS (5–30) days
     sampled from the full seeded dataset, giving exposure to multiple market regimes.
+
+    Args:
+        historical_winners: Optional list of param dicts from previous optimizer
+            runs (loaded from DB via load_top_trial_params).  Each winner is:
+            1. Pinned as an exact guaranteed trial on a fresh random window.
+            2. Used as an additional exploitation centre — EXPLOIT_RATIO/N trials
+               sample within the standard radii around each winner.
+            This ensures validated parameter sets are always reconsidered and
+            never lost to random search noise between restarts.
 
     Returns dict:
         {
@@ -155,6 +166,59 @@ def optimise_params(
             return days, 0
         offset = int(rng.integers(0, total_candles - n_candles + 1))
         return days, offset
+
+    def _winner_to_key(hw: dict):
+        """Convert a historical-winner param dict to the internal integer key tuple.
+        Returns None if the dict is missing required fields.
+        """
+        try:
+            ma        = int(np.clip(hw["ma_len"], OPT_MA_LEN_MIN, OPT_MA_LEN_MAX))
+            bm_x10    = int(np.clip(
+                round(float(hw["band_mult"]) * 10),
+                OPT_BAND_MULT_X10_MIN, OPT_BAND_MULT_X10_MAX))
+            trail_x10000 = int(np.clip(
+                round(float(hw.get("trail_pct", TRAIL_STOP_PCT)) * 10000),
+                OPT_TRAIL_X10000_MIN, OPT_TRAIL_X10000_MAX))
+            exit_ma   = int(np.clip(
+                hw.get("exit_ma_len", DEFAULT_EXIT_MA_LEN),
+                OPT_EXIT_MA_LEN_MIN, OPT_EXIT_MA_LEN_MAX))
+            exit_bm10 = int(np.clip(
+                round(float(hw.get("exit_band_mult", DEFAULT_EXIT_BAND_MULT)) * 10),
+                OPT_EXIT_BAND_MULT_X10_MIN, OPT_EXIT_BAND_MULT_X10_MAX))
+            adx_int   = int(np.clip(
+                round(float(hw.get("adx_threshold", ADX_THRESHOLD))),
+                OPT_ADX_MIN, OPT_ADX_MAX))
+            rsi_lo    = int(np.clip(
+                round(float(hw.get("rsi_neutral_lo", RSI_NEUTRAL_LO))),
+                OPT_RSI_LO_MIN, OPT_RSI_LO_MAX))
+            bema      = int(np.clip(
+                hw.get("band_ema_len", BAND_EMA_LENGTH),
+                OPT_BAND_EMA_MIN, OPT_BAND_EMA_MAX))
+            adx_per   = int(np.clip(
+                hw.get("adx_period", ADX_PERIOD),
+                OPT_ADX_PERIOD_MIN, OPT_ADX_PERIOD_MAX))
+            rsi_per   = int(np.clip(
+                hw.get("rsi_period", RSI_PERIOD),
+                OPT_RSI_PERIOD_MIN, OPT_RSI_PERIOD_MAX))
+            lev       = _fixed_lev if _fixed_lev is not None else int(
+                min(OPT_LEVERAGE_VALUES,
+                    key=lambda v: abs(v - float(hw.get("leverage", DEFAULT_LEVERAGE)))))
+            return (ma, bm_x10, trail_x10000, exit_ma, exit_bm10,
+                    adx_int, rsi_lo, bema, adx_per, rsi_per, lev)
+        except Exception:
+            return None
+
+    # ── Phase 0: Pinned exact-replay of historical winners ─────────────────────
+    # Each historical winner is run on a fresh random window so it competes on
+    # equal footing against new candidates rather than cached results.
+    n_pinned = 0
+    if historical_winners:
+        for hw in historical_winners:
+            key = _winner_to_key(hw)
+            if key is not None and key not in seen:
+                seen.add(key)
+                combos.append((key, *_random_window()))
+                n_pinned += 1
 
     # Exploitation: sample near saved best
     if saved_best and n_exploit > 0:
@@ -241,6 +305,74 @@ def optimise_params(
                 seen.add(key)
                 combos.append((key, *_random_window()))
 
+    # ── Phase 2: Multi-centre exploitation around each historical winner ──────
+    # Allocate EXPLOIT_RATIO / N trials near each historical winner so the
+    # optimizer probes promising regions from previous sessions, not just the
+    # current live params.
+    if historical_winners:
+        n_hw          = len(historical_winners)
+        n_per_winner  = max(1, int(trials * EXPLOIT_RATIO / n_hw))
+        for hw in historical_winners:
+            base = _winner_to_key(hw)
+            if base is None:
+                continue
+            (b_ma, b_bm_x10, b_trail_x10000, b_exit_ma, b_exit_bm10,
+             b_adx, b_rsi_lo, b_bema, b_adx_per, b_rsi_per, b_lev) = base
+            _b_lev_idx = OPT_LEVERAGE_VALUES.index(b_lev)
+            attempts = hw_count = 0
+            while hw_count < n_per_winner and attempts < n_per_winner * 20:
+                attempts += 1
+                ma         = int(np.clip(
+                    rng.integers(b_ma - EXPLOIT_MA_LEN_RADIUS, b_ma + EXPLOIT_MA_LEN_RADIUS + 1),
+                    OPT_MA_LEN_MIN, OPT_MA_LEN_MAX))
+                bm_x10     = int(np.clip(
+                    rng.integers(b_bm_x10 - EXPLOIT_BAND_MULT_RADIUS_X10,
+                                 b_bm_x10 + EXPLOIT_BAND_MULT_RADIUS_X10 + 1),
+                    OPT_BAND_MULT_X10_MIN, OPT_BAND_MULT_X10_MAX))
+                trail_x10000 = int(np.clip(
+                    rng.integers(b_trail_x10000 - EXPLOIT_TRAIL_RADIUS_X10000,
+                                 b_trail_x10000 + EXPLOIT_TRAIL_RADIUS_X10000 + 1),
+                    OPT_TRAIL_X10000_MIN, OPT_TRAIL_X10000_MAX))
+                exit_ma    = int(np.clip(
+                    rng.integers(b_exit_ma - EXPLOIT_EXIT_MA_LEN_RADIUS,
+                                 b_exit_ma + EXPLOIT_EXIT_MA_LEN_RADIUS + 1),
+                    OPT_EXIT_MA_LEN_MIN, OPT_EXIT_MA_LEN_MAX))
+                exit_bm10  = int(np.clip(
+                    rng.integers(b_exit_bm10 - EXPLOIT_EXIT_BAND_MULT_RADIUS_X10,
+                                 b_exit_bm10 + EXPLOIT_EXIT_BAND_MULT_RADIUS_X10 + 1),
+                    OPT_EXIT_BAND_MULT_X10_MIN, OPT_EXIT_BAND_MULT_X10_MAX))
+                adx_int    = int(np.clip(
+                    rng.integers(b_adx - EXPLOIT_ADX_RADIUS, b_adx + EXPLOIT_ADX_RADIUS + 1),
+                    OPT_ADX_MIN, OPT_ADX_MAX))
+                rsi_lo_int = int(np.clip(
+                    rng.integers(b_rsi_lo - EXPLOIT_RSI_LO_RADIUS,
+                                 b_rsi_lo + EXPLOIT_RSI_LO_RADIUS + 1),
+                    OPT_RSI_LO_MIN, OPT_RSI_LO_MAX))
+                band_ema   = int(np.clip(
+                    rng.integers(b_bema - EXPLOIT_BAND_EMA_RADIUS,
+                                 b_bema + EXPLOIT_BAND_EMA_RADIUS + 1),
+                    OPT_BAND_EMA_MIN, OPT_BAND_EMA_MAX))
+                adx_period = int(np.clip(
+                    rng.integers(b_adx_per - EXPLOIT_ADX_PERIOD_RADIUS,
+                                 b_adx_per + EXPLOIT_ADX_PERIOD_RADIUS + 1),
+                    OPT_ADX_PERIOD_MIN, OPT_ADX_PERIOD_MAX))
+                rsi_period = int(np.clip(
+                    rng.integers(b_rsi_per - EXPLOIT_RSI_PERIOD_RADIUS,
+                                 b_rsi_per + EXPLOIT_RSI_PERIOD_RADIUS + 1),
+                    OPT_RSI_PERIOD_MIN, OPT_RSI_PERIOD_MAX))
+                if _fixed_lev is not None:
+                    lev_int = _fixed_lev
+                else:
+                    _lo = max(0, _b_lev_idx - EXPLOIT_LEVERAGE_RADIUS)
+                    _hi = min(len(OPT_LEVERAGE_VALUES) - 1, _b_lev_idx + EXPLOIT_LEVERAGE_RADIUS)
+                    lev_int = int(OPT_LEVERAGE_VALUES[int(rng.integers(_lo, _hi + 1))])
+                key = (ma, bm_x10, trail_x10000, exit_ma, exit_bm10,
+                       adx_int, rsi_lo_int, band_ema, adx_period, rsi_period, lev_int)
+                if key not in seen:
+                    seen.add(key)
+                    combos.append((key, *_random_window()))
+                    hw_count += 1
+
     # Exploration: fully random
     attempts = 0
     while len(combos) < trials and attempts < trials * 20:
@@ -279,10 +411,20 @@ def optimise_params(
         else:
             print(f"  Leverage — {OPT_LEVERAGE_VALUES} (optimised)")
         print(f"  Window   — {OPT_MIN_DAYS} days (fixed)")
+        n_explore = total - n_pinned - n_exploit - (
+            sum(1 for _ in historical_winners) * max(1, int(trials * EXPLOIT_RATIO / max(len(historical_winners or []), 1)))
+            if historical_winners else 0
+        )
+        parts = []
+        if n_pinned:
+            parts.append(f"{n_pinned} pinned (historical winners)")
         if saved_best:
-            print(f"  Mode: {n_exploit} exploitation + {len(combos)-n_exploit} exploration")
-        else:
-            print(f"  Mode: {total} fully random")
+            parts.append(f"{n_exploit} exploitation (current params)")
+        if historical_winners:
+            n_hw = len(historical_winners)
+            parts.append(f"{n_hw}×{max(1, int(trials * EXPLOIT_RATIO / n_hw))} exploitation (historical centres)")
+        parts.append(f"{total - n_pinned - n_exploit} exploration")
+        print(f"  Mode: {' + '.join(parts)}")
         print(f"  Min trades filter: ≥{OPT_MIN_TRADES_PER_DAY:.1f}/day  "
               f"(≥{max(OPT_MIN_TRADES, int(OPT_MAX_DAYS * OPT_MIN_TRADES_PER_DAY))} over {OPT_MAX_DAYS}d)\n")
 

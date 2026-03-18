@@ -729,6 +729,12 @@ class LiveRealTrader:
                                 "leverage":        self.exit_params.leverage,
                             }  # noqa: E501
 
+                        # Seed with top historical winners so validated params
+                        # are always reconsidered, never lost to random search.
+                        historical_winners = _db.load_top_trial_params(
+                            symbol=sym, interval=iv,
+                        ) or None
+
                         opt = optimise_params(
                             df_last=df_last,
                             trials=INIT_TRIALS,
@@ -736,6 +742,7 @@ class LiveRealTrader:
                             fee_rate=taker_fee_for(sym),
                             interval_minutes=interval_minutes(iv),
                             saved_best=saved_best,
+                            historical_winners=historical_winners,
                             borrow_hourly_rate=_live_borrow_rate,
                             db_symbol=sym, db_interval=iv, db_trigger="REOPT",
                             fixed_leverage=C.DEFAULT_LEVERAGE,

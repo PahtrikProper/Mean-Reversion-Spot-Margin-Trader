@@ -158,6 +158,10 @@ OPT_N_RANDOM          = INIT_TRIALS
 OPT_MIN_TRADES_PER_DAY = 1.0   # discard any trial with < 1 trade/day on average
 OPT_MIN_TRADES        = 1      # absolute floor (kept for very short windows)
 
+# Number of top historical trial winners to pin as guaranteed trials and use
+# as additional exploitation centres in subsequent optimisation runs.
+OPT_HISTORICAL_WINNERS = 5
+
 RANDOM_SEED       = None     # set int for reproducible runs
 
 # Exploitation: sample near saved best params
